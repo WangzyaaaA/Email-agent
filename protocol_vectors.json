@@ -1,0 +1,27 @@
+{
+  "content_root_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  "device_id": "device_0123456789",
+  "key_id": "key_0123456789",
+  "message_id": "message_0123456789",
+  "message_key": "_-b1a2uJcIzamuRftpQ8dnlDQclEvoeCvTXFX6l98vg",
+  "device_auth_key": "XzQFgaXsNVUwe_OifVicSkBjWImHZRaZMK9uZ-vpd-w",
+  "plaintext": "{\"body\":\"Code 123456 valid for 10 minutes\",\"created_at\":\"2030-01-01T00:00:00Z\",\"kind\":\"otp\",\"schema\":1,\"sensitive\":true,\"title\":\"OTP example\"}",
+  "envelope": {
+    "version": "1",
+    "message_id": "message_0123456789",
+    "device_id": "device_0123456789",
+    "key_id": "key_0123456789",
+    "priority": "high",
+    "expires_at": "2030-01-01T00:10:00Z",
+    "nonce": "AAECAwQFBgcICQoL",
+    "ciphertext": "MmZSpCk64gcDql0oVrng_dez8xq9sUlnwvK7ZKzcdStt76dPH3_YRSiBzAkUuAsw9Giq27-xG4d5dvjStwxPm8dQ8kW51AZrdOuF5UfW0egKAK7S-LAc-yh0GrHdrIijOD8jfqXmV8c1f-kmqdfCJLEsLKI3RhNFwhKFwr2WsqvtrokZ-teJGE8fTXpcr85xqh-YpunbBg7VNfhkNeI"
+  },
+  "request": {
+    "method": "POST",
+    "path_and_query": "/v1/devices/status",
+    "body": "{}",
+    "timestamp": "1893456000",
+    "nonce": "EBESExQVFhcYGRobHB0eHw",
+    "signature": "1-0x3Zj2cz_ep-4RLrUfR4AJvGiznIV5jwxRmyV_Fy0"
+  }
+}

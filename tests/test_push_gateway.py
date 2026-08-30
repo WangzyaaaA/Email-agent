@@ -1,0 +1,210 @@
+from __future__ import annotations
+
+import json
+import secrets
+from datetime import timedelta
+
+from fastapi.testclient import TestClient
+from sqlalchemy import select
+
+from app.push_protocol import (
+    b64url_encode,
+    derive_device_keys,
+    encrypt_envelope,
+    new_opaque_id,
+    notification_plaintext,
+    sign_device_request,
+)
+from push_gateway.config import GatewaySettings
+from push_gateway.database import create_gateway_engine, create_session_factory
+from push_gateway.fcm import FcmResult
+from push_gateway.main import create_app
+from push_gateway.models import Device, GatewayCredential, GatewayMessage, utcnow
+from push_gateway.security import GatewayCipher, new_token
+from push_gateway.service import flush_gateway_messages
+
+
+class FakeFcm:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def send(self, **kwargs):
+        self.calls.append(kwargs)
+        return FcmResult(True, message_name="projects/example/messages/opaque")
+
+
+def _signed_headers(token: str, auth_key: bytes, method: str, target: str, body: bytes, nonce: bytes | None = None) -> dict[str, str]:
+    timestamp = str(int(utcnow().timestamp()))
+    nonce_text = b64url_encode(nonce or secrets.token_bytes(16))
+    signature = sign_device_request(
+        auth_key,
+        method=method,
+        path_and_query=target,
+        body=body,
+        timestamp=timestamp,
+        nonce=nonce_text,
+    )
+    return {
+        "Authorization": f"Bearer {token}",
+        "X-MS-Timestamp": timestamp,
+        "X-MS-Nonce": nonce_text,
+        "X-MS-Signature": signature,
+        "Content-Type": "application/json",
+    }
+
+
+def test_gateway_scope_pairing_replay_idempotency_delivery_pending_ack_and_revoke() -> None:
+    settings = GatewaySettings(
+        master_key="gateway-master-key-with-more-than-32-random-characters",
+        database_url="sqlite:///:memory:",
+        firebase_project_id="test-project",
+        allow_http_for_tests=False,
+        request_rate_per_minute=1000,
+    )
+    engine = create_gateway_engine(settings)
+    factory = create_session_factory(engine)
+    publisher = new_token()
+    device_admin = new_token()
+    cipher = GatewayCipher(settings.master_key)
+    fake_fcm = FakeFcm()
+    app = create_app(settings, engine=engine, fcm_client=fake_fcm)
+    with factory() as db:
+        db.add_all(
+            [
+                GatewayCredential(kind="publisher", token_fingerprint=cipher.fingerprint(publisher)),
+                GatewayCredential(kind="device_admin", token_fingerprint=cipher.fingerprint(device_admin)),
+            ]
+        )
+        db.commit()
+
+    root = bytes(range(32))
+    device_id = "device_0123456789"
+    key_id = "key_0123456789"
+    device_token = b64url_encode(bytes([7]) * 32)
+    _, auth_key = derive_device_keys(root, device_id)
+    provision = {
+        "device_id": device_id,
+        "key_id": key_id,
+        "device_token": device_token,
+        "device_auth_key": b64url_encode(auth_key),
+        "activation_expires_at": (utcnow() + timedelta(minutes=10)).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    }
+
+    with TestClient(app, base_url="https://gateway.test") as client:
+        wrong_scope = client.post("/v1/devices/provision", json=provision, headers={"Authorization": f"Bearer {publisher}"})
+        assert wrong_scope.status_code == 401
+        response = client.post("/v1/devices/provision", json=provision, headers={"Authorization": f"Bearer {device_admin}"})
+        assert response.status_code == 200 and response.json()["status"] == "pending_activation"
+
+        token_only = client.post(
+            "/v1/devices/register",
+            json={"device_id": device_id, "fcm_token": "attacker-registration-token", "registration_version": 1, "app_protocol_version": 1},
+            headers={"Authorization": f"Bearer {device_token}"},
+        )
+        assert token_only.status_code == 401
+
+        register = json.dumps(
+            {
+                "device_id": device_id,
+                "fcm_token": "fcm-registration-token-value",
+                "registration_version": 1,
+                "app_protocol_version": 1,
+            },
+            separators=(",", ":"),
+        ).encode()
+        fixed_nonce = bytes.fromhex("101112131415161718191a1b1c1d1e1f")
+        headers = _signed_headers(device_token, auth_key, "POST", "/v1/devices/register", register, fixed_nonce)
+        response = client.post("/v1/devices/register", content=register, headers=headers)
+        assert response.status_code == 200 and response.json()["status"] == "active"
+        replay = client.post("/v1/devices/register", content=register, headers=headers)
+        assert replay.status_code == 409 and replay.json()["error"]["code"] == "replay_detected"
+        stale_headers = _signed_headers(device_token, auth_key, "POST", "/v1/devices/register", register)
+        stale = client.post("/v1/devices/register", content=register, headers=stale_headers)
+        assert stale.status_code == 409 and stale.json()["error"]["code"] == "stale_registration_version"
+
+        expires = utcnow() + timedelta(minutes=30)
+        plaintext = notification_plaintext(
+            kind="otp", title="OTP", body="Code 123456", created_at=utcnow()
+        )
+        envelope = encrypt_envelope(
+            content_root_key=root,
+            message_id="message_0123456789",
+            device_id=device_id,
+            key_id=key_id,
+            priority="high",
+            expires_at=expires,
+            plaintext=plaintext,
+        )
+        publish = {"idempotency_key": "dedupe_0123456789", "envelope": envelope}
+        headers_publisher = {"Authorization": f"Bearer {publisher}"}
+        accepted = client.post("/v1/messages", json=publish, headers=headers_publisher)
+        assert accepted.status_code == 200 and accepted.json()["status"] == "accepted"
+        gateway_message_id = accepted.json()["gateway_message_id"]
+        duplicate = client.post("/v1/messages", json=publish, headers=headers_publisher)
+        assert duplicate.json()["gateway_message_id"] == gateway_message_id
+        conflict_payload = json.loads(json.dumps(publish))
+        conflict_payload["envelope"]["ciphertext"] = ("A" if envelope["ciphertext"][0] != "A" else "B") + envelope["ciphertext"][1:]
+        conflict = client.post("/v1/messages", json=conflict_payload, headers=headers_publisher)
+        assert conflict.status_code == 409 and conflict.json()["error"]["code"] == "idempotency_conflict"
+
+        assert flush_gateway_messages(factory, settings, fake_fcm) == 1
+        assert fake_fcm.calls[0]["envelope"]["gateway_message_id"] == gateway_message_id
+        assert "Code 123456" not in json.dumps(fake_fcm.calls[0])
+        with factory() as db:
+            stored_device = db.scalar(select(Device).where(Device.device_id == device_id))
+            stored_message = db.scalar(select(GatewayMessage).where(GatewayMessage.gateway_message_id == gateway_message_id))
+            assert stored_device is not None and stored_device.fcm_token_encrypted != "fcm-registration-token-value"
+            assert stored_message is not None and "Code 123456" not in (stored_message.envelope_encrypted or "")
+
+        target = "/v1/messages/pending?limit=50"
+        pending_headers = _signed_headers(device_token, auth_key, "GET", target, b"")
+        pending_headers.pop("Content-Type")
+        pending = client.get(target, headers=pending_headers)
+        assert pending.status_code == 200 and len(pending.json()["items"]) == 1
+        assert pending.json()["items"][0]["envelope"]["ciphertext"] == envelope["ciphertext"]
+
+        ack_body = json.dumps({"device_id": device_id, "result": "shown"}, separators=(",", ":")).encode()
+        ack_target = f"/v1/messages/{gateway_message_id}/ack"
+        ack = client.post(
+            ack_target,
+            content=ack_body,
+            headers=_signed_headers(device_token, auth_key, "POST", ack_target, ack_body),
+        )
+        assert ack.status_code == 200 and ack.json()["status"] == "acknowledged"
+        with factory() as db:
+            row = db.scalar(select(GatewayMessage).where(GatewayMessage.gateway_message_id == gateway_message_id))
+            assert row is not None and row.envelope_encrypted is None
+
+        device_cannot_publish = client.post("/v1/messages", json=publish, headers={"Authorization": f"Bearer {device_token}"})
+        assert device_cannot_publish.status_code == 401
+        admin_cannot_publish = client.post("/v1/messages", json=publish, headers={"Authorization": f"Bearer {device_admin}"})
+        assert admin_cannot_publish.status_code == 401
+        revoke = client.post(
+            f"/v1/devices/{device_id}/revoke",
+            json={},
+            headers={"Authorization": f"Bearer {device_admin}"},
+        )
+        assert revoke.status_code == 200 and revoke.json()["status"] == "revoked"
+        with factory() as db:
+            device = db.scalar(select(Device).where(Device.device_id == device_id))
+            assert device is not None
+            assert device.fcm_token_encrypted is None
+            assert device.device_auth_key_encrypted is None
+            assert device.device_token_fingerprint is None
+
+
+def test_gateway_rejects_plain_http_and_non_json_without_echoing_secrets() -> None:
+    settings = GatewaySettings(
+        master_key="gateway-master-key-with-more-than-32-random-characters",
+        database_url="sqlite:///:memory:",
+        firebase_project_id="test-project",
+        request_rate_per_minute=1000,
+    )
+    app = create_app(settings, fcm_client=FakeFcm())
+    with TestClient(app, base_url="http://gateway.test") as client:
+        response = client.get("/healthz")
+        assert response.status_code == 400 and response.json() == {"error": {"code": "https_required"}}
+    with TestClient(app, base_url="https://gateway.test") as client:
+        response = client.post("/v1/messages", content="secret=value", headers={"Content-Type": "text/plain"})
+        assert response.status_code == 415
+        assert "secret" not in response.text

@@ -1,0 +1,26 @@
+{$PUSH_GATEWAY_DOMAIN} {
+    encode zstd gzip
+    request_body {
+        max_size 16KB
+    }
+    reverse_proxy gateway:8090
+    header {
+        -Server
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer"
+    }
+    log {
+        output stdout
+        format filter {
+            wrap json
+            fields {
+                request>headers>Authorization delete
+                request>headers>X-MS-Signature delete
+                request>headers>X-MS-Nonce delete
+                request>body delete
+                response>body delete
+            }
+        }
+    }
+}

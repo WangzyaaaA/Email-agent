@@ -1,0 +1,58 @@
+services:
+  gateway:
+    build:
+      context: ../..
+      dockerfile: push_gateway/Dockerfile
+    restart: unless-stopped
+    environment:
+      PUSH_GATEWAY_MASTER_KEY: "${PUSH_GATEWAY_MASTER_KEY:?Set PUSH_GATEWAY_MASTER_KEY}"
+      PUSH_GATEWAY_DATABASE_URL: "sqlite:////data/push_gateway.db"
+      PUSH_GATEWAY_HOST: "0.0.0.0"
+      PUSH_GATEWAY_PORT: "8090"
+      PUSH_GATEWAY_FIREBASE_PROJECT_ID: "${PUSH_GATEWAY_FIREBASE_PROJECT_ID:?Set Firebase project id}"
+      PUSH_GATEWAY_FIREBASE_SERVICE_ACCOUNT_FILE: "/run/secrets/firebase-service-account.json"
+      PUSH_GATEWAY_TRUSTED_PROXY_HEADERS: "true"
+    volumes:
+      - gateway-data:/data
+      - ./secrets/firebase-service-account.json:/run/secrets/firebase-service-account.json:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - internal
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    ports:
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      PUSH_GATEWAY_DOMAIN: "${PUSH_GATEWAY_DOMAIN:?Set the gateway domain}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - internal
+    depends_on:
+      - gateway
+
+networks:
+  internal:
+    internal: false
+
+volumes:
+  gateway-data:
+  caddy-data:
+  caddy-config:

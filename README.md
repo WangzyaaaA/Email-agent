@@ -1,0 +1,210 @@
+# 邮箱智能 Agent
+
+一个运行在家中 NAS 的只读邮箱助手，支持 QQ 邮箱、Gmail、阿里企业邮箱/钉邮和自定义 IMAP。它可以识别白名单验证码、提醒重要邮件、跟踪截止日期与待回复事项，并通过 WxPusher 或端到端加密的自建 Android FCM 通道发送通知与日、周、月总结。
+
+## 安全设计
+
+- IMAP 目录始终以只读模式打开，读取使用 `BODY.PEEK`，不会改变已读状态。
+- 先读取 `BODYSTRUCTURE`，只下载受限大小的文本 MIME section；附件不会下载到 NAS。
+- 邮件正文仅在内存中处理。数据库保存元数据、脱敏摘要、待办和审计记录，默认 90 天清理。
+- 邮箱密码、WxPusher Token、模型密钥和短期重试内容使用 NAS 主密钥加密。
+- 验证码仅对白名单来源推送；成功发送或过期后立即删除通知密文，数据库只长期保留不可逆指纹和遮罩预览。
+- 只信任已知邮箱服务商认证服务器写入的 SPF/DKIM/DMARC 结果，邮件自行伪造的 `Authentication-Results` 不会获得信任。
+- 管理台必须登录且所有写操作都有 CSRF 防护。应用没有自动回信、删除、移动或标记邮件的代码路径。
+
+WxPusher 是第三方通知服务。完整验证码会短暂经过 WxPusher；只应为可信发件人建立白名单。自建 Android 通道会在 NAS 上加密标题、摘要和验证码，公网网关与 FCM 只看到应用层密文。
+
+## NAS Docker 部署
+
+1. 复制环境变量文件并生成随机主密钥：
+
+   ```powershell
+   Copy-Item .env.example .env
+   python -c "import secrets; print(secrets.token_urlsafe(48))"
+   ```
+
+2. 把生成值填入 `.env` 的 `EMAIL_AGENT_MASTER_KEY`。主密钥丢失后，已保存的邮箱凭据无法恢复；请将它和数据库卷分别备份。
+
+3. 启动：
+
+   ```powershell
+   docker compose up -d --build
+   ```
+
+4. 在局域网访问 `http://NAS地址:8080`，完成管理员和 WxPusher 首次配置，再添加邮箱。
+
+Docker Compose 使用名为 `mail-sentinel-data` 的卷保存 SQLite 数据库。若需要从公网访问，必须在可信反向代理后启用 HTTPS，并设置 `EMAIL_AGENT_SECURE_COOKIES=true`；不建议直接暴露 8080 端口。
+
+## 邮箱准备
+
+### QQ 邮箱
+
+- 在 QQ 邮箱设置中开启 IMAP/SMTP。
+- 生成独立授权码；添加邮箱时填写授权码，不要填写 QQ 密码。
+- 服务器预设为 `imap.qq.com:993`。
+
+### Gmail
+
+- 开启 Google 两步验证并生成应用专用密码。
+- 服务器预设为 `imap.gmail.com:993`。
+- 部分单位账号、高级保护账号或仅使用安全密钥的账号可能无法生成应用密码；首版不含 Gmail OAuth。
+- 认证失败与登录后的邮件同步失败会分别显示；若应用密码测试成功但提示同步失败，无需先重置密码，应检查服务器返回的 MIME section 兼容错误。
+
+### 钉钉企业邮箱 / 阿里企业邮箱
+
+钉邮是客户端，实际连接取决于底层邮箱服务。添加页面会先根据邮箱域名的 MX/CNAME 给出建议，用户确认服务器后才会提交凭据。
+
+若底层为阿里企业邮箱：
+
+- 请管理员在阿里邮箱域管理后台把该账号加入“三方客户端访问策略”例外。
+- 为账号开启 IMAP，并生成“三方客户端安全密码”。
+- 若企业启用了 IP 白名单，将 NAS 出口 IP 加入允许范围。
+- 推荐服务器为 `imap.qiye.aliyun.com:993`；香港节点、旧版或自定义域名可手动覆盖。
+
+若钉邮绑定的是其他企业邮箱，选择“自定义 IMAP”，并向管理员索取 SSL IMAP 地址。管理员无法开放 IMAP 时，应用会显示受限状态，不会通过浏览器模拟登录绕过策略。
+
+## WxPusher 与模型
+
+- 在 WxPusher 创建应用，取得 AppToken 和个人 UID，在设置页保存后使用“测试通知”。
+- 云模型是可选项。填写 OpenAI 兼容的 base URL、模型名和 API Key 后，规则无法确定的重要性会使用模型补充分类。
+- 发给模型前会去掉引用历史、跟踪链接和附件，并遮盖验证码、密码、Bearer Token、JWT 与长随机凭据。
+- 模型不可用时，本地硬规则继续工作；脱敏后的待分类内容最多加密保留 24 小时用于重试。
+
+## 自建 Android FCM 推送
+
+该通道由三个独立组件组成：家庭 NAS 上的 Mail Sentinel、公网 HTTPS Push Gateway，以及装有 Google Play 服务的 Android App。NAS 只主动出站，不新增公网入口；网关没有邮箱连接、管理页或通知内容密钥；App 只负责配对、解密、去重和显示通知，不能控制邮箱或 NAS。
+
+通知状态分为三个层次：
+
+- NAS 记录“网关已接受”，只表示网关事务已持久化；
+- 网关记录“FCM 已接受”，仍不代表手机已经显示；
+- App 安全落地并显示通知（或发现通知权限关闭）后发送 ACK，网关随即清除消息密文。
+
+正常路径只使用一个主通道，不并行双发。选择自建通道后，仅验证码、账号安全告警和 critical 两小时截止提醒可在网关快速失败三次后一次性回退到已配置的 WxPusher。鉴权、证书或请求格式错误不回退；手机离线、未 ACK 或通知权限关闭也不会触发回退。每条通知在入队时冻结通道，更改全局设置不会改变旧通知的路线。
+
+### 升级已有 NAS 数据库
+
+本版本会幂等增加通知路线和冻结信封字段，并新建 `push_devices` 表，不会删除旧通知或配置。升级前必须备份 SQLite 数据库或 Docker volume。可在停掉应用后使用带备份的升级命令：
+
+```powershell
+.\.venv\Scripts\python.exe -m app.migrations upgrade --database-url sqlite:///./data/mail_sentinel.db
+```
+
+命令会先在数据库旁创建带 UTC 时间戳的 `.bak` 文件。若尚未写入新字段，可用同样方式执行 `downgrade`；回滚应用前仍应保留升级前备份。应用启动也会执行同一套幂等升级，但不能代替升级前备份。不要通过删除数据库或 Docker volume 升级。
+
+### 部署公网 Push Gateway
+
+1. 准备独立域名，只把 TCP 443 指向该服务器。不要在同一域名代理 Mail Sentinel 管理页。
+2. 在独立 Firebase 项目启用 FCM HTTP v1，为网关创建只具备发送消息权限的服务账号，将 JSON 保存为 `deploy/push-gateway/secrets/firebase-service-account.json`。该文件不是 Android 的 `google-services.json`，不得提交仓库。
+3. 复制并填写网关环境文件：
+
+   ```powershell
+   Set-Location deploy\push-gateway
+   Copy-Item .env.example .env
+   python -c "import secrets; print(secrets.token_urlsafe(48))"
+   ```
+
+4. 启动网关和 Caddy：
+
+   ```powershell
+   docker compose up -d --build
+   ```
+
+5. 只在网关主机本地初始化两类 NAS Token。它们只显示一次：
+
+   ```powershell
+   docker compose run --rm gateway python -m push_gateway.cli init
+   ```
+
+   `publisher` 只能发布和查询幂等状态；`device_admin` 只能预配、查询激活和吊销设备。轮换时使用 `python -m push_gateway.cli rotate publisher` 或 `rotate device_admin`，先验证新 Token，再用 `list` 查看旧凭据 ID，并以 `revoke <credential_id>` 停用旧版本。CLI 会拒绝停用某作用域的最后一个有效凭据。
+
+网关容器使用独立 SQLite 卷、非 root 用户、只读根文件系统和最小 capabilities。主密钥、Firebase 服务账号与数据库备份必须分开保存。ACK、过期或吊销会立即清除消息信封；无内容状态保留 7 天，防重放 nonce 只保留签名接受窗口。公网不启用 OpenAPI 文档。
+
+反向代理访问日志必须继续删除 Authorization、设备签名、nonce 和请求/响应体。`deploy/push-gateway/Caddyfile` 已包含相应过滤和 16 KiB 请求上限。网关应用端口不映射到公网。
+
+### NAS 配置、配对与吊销
+
+1. 在局域网管理页打开“Android 推送”，填写规范的 `https://` 网关源站，以及离线命令生成的 Publisher Token 和 Device Admin Token。
+2. 重新输入管理员密码创建配对。NAS 会先在网关预配设备认证密钥，成功后才显示十分钟有效的一次性二维码。
+3. 用 Android App 扫描二维码。二维码包含完整设备凭据，只显示一次，页面使用 `no-store`、严格 CSP 和 `no-referrer`。
+4. App 完成 FCM 登记标识（当前 SDK 使用 FID）登记后，在 NAS 页检查激活状态，再明确选择“自建 Android FCM”为后续通知主通道。
+5. 丢失设备时，在同一页面重新输入管理员密码并确认吊销。NAS 会立即停用旧通道；网关离线时后台持续重试，确认后才删除 NAS 上的内容根密钥。
+
+配对、测试、通道切换和吊销都是登录后的 POST 操作并校验 CSRF。Android 没有这些管理接口。
+
+### 构建 Android App
+
+项目位于 `android/`，使用 API 37.1 编译、目标 API 36、最低 API 26，并使用 Firebase Android BoM 34.18.0。编译 SDK 与目标 SDK 分离，使依赖获得当前平台 API 与安全修复，同时不在缺少物理设备回归时贸然启用 Android 17 的目标行为。App 不使用自建 WSS、永久前台服务、analytics 或崩溃上报，也不申请通讯录、短信、存储、悬浮窗或辅助功能权限。
+
+在用户自己的 `~/.gradle/gradle.properties`（不要提交）中填写 Firebase Android 公共项目标识：
+
+```properties
+MAIL_SENTINEL_FIREBASE_API_KEY=...
+MAIL_SENTINEL_FIREBASE_APPLICATION_ID=...
+MAIL_SENTINEL_FIREBASE_PROJECT_ID=...
+MAIL_SENTINEL_FIREBASE_SENDER_ID=...
+```
+
+然后运行：
+
+```powershell
+Set-Location android
+.\gradlew.bat :app:test :app:assembleRelease
+```
+
+正式侧载包必须使用用户离线保管的 release keystore。通过 Gradle 用户配置或 CI Secret 提供以下属性/环境变量，路径不得位于仓库：
+
+```text
+MAIL_SENTINEL_KEYSTORE_FILE
+MAIL_SENTINEL_KEYSTORE_PASSWORD
+MAIL_SENTINEL_KEY_ALIAS
+MAIL_SENTINEL_KEY_PASSWORD
+```
+
+未提供签名配置时只生成未签名 release 产物，不能视为正式发布包。debug APK、测试 Firebase 项目和测试网关不得复用生产凭据。
+
+App 使用 Android Keystore 中不可导出的 AES 包装密钥加密 content root key、device token 和 FCM 登记标识；当前 Firebase SDK 使用 FID 模式（`register` / `onRegistered`），不调用已弃用的 Token 获取接口。私有凭据、密文数据库和去重记录全部排除在 Auto Backup 与设备迁移之外。Android 13+ 会在解释用途后请求通知权限。验证码与安全告警默认使用锁屏隐藏的敏感通知；用户可显式开启预览，但通知历史、截图和辅助功能风险会增加。
+
+### 网关故障排查
+
+- `gateway_authentication_failed`：Publisher Token 不匹配或已停用；不会回退。
+- `tls_validation_failed` / `redirect_rejected`：证书、主机名或网关 URL 配置不安全；不会忽略证书，也不会携带凭据跟随重定向。
+- `device_unavailable`：设备尚未激活或 FCM 登记标识已失效。未过期密文仍可由 App 的 pending 同步补偿。
+- `submission_uncertain`：POST 结果不确定且状态查询也不可达；紧急类别最终可能受限回退，并接受极少数跨通道重复，由 App message ID 去重。
+- App 显示“通知权限受限”：打开系统总通知权限和三个通知渠道。网关已接受但 App 权限关闭不能触发 WxPusher 回退。
+
+真实联调必须由用户提供自己的 Firebase 项目、公网域名和测试设备。自动化测试不连接真实 Firebase、邮箱、WxPusher 或云模型。
+
+## 默认行为
+
+- 验证码未知来源先进入候选列表；批准邮箱地址或域名后，后续验证码才会推送。
+- 高优先级与严重告警立即发送。22:30–07:30 延迟普通通知；验证码、安全告警和两小时内到期事项不受影响。
+- 截止日期提前 24 小时和 2 小时提醒；已发送的请求 3 天未收到线程回复时提醒一次。
+- 北京时间每日 20:30、周日 20:30、每月最后一天 20:30 发送总结；同一时间的多个总结会合并。
+- 首次连接只回溯最近 7 天、每目录最多 500 封，且不会补发历史验证码或历史重要提醒。
+
+## 本地开发与测试
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install ".[test,gateway]"
+$env:EMAIL_AGENT_MASTER_KEY = python -c "import secrets; print(secrets.token_urlsafe(48))"
+.\.venv\Scripts\python.exe -m app
+```
+
+运行测试：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m compileall -q app push_gateway tests
+.\.venv\Scripts\python.exe -m pip check
+```
+
+自动化测试不会连接真实邮箱或 WxPusher。真实连接需要在管理台由用户确认服务器并提供授权码后测试。
+
+## 运维注意事项
+
+- NAS 与公网网关都使用各自的单个应用实例和单个 Uvicorn worker；两者使用独立进程、配置前缀、数据库、卷和容器镜像。
+- WxPusher 的 HTTP 接口不提供业务幂等键。极端情况下，如果进程在第三方已接收消息、但本地提交状态前崩溃，租约恢复可能造成一次重复通知，系统优先保证不漏告警。
+- 修改主密钥前应先在管理台重新准备所有外部凭据；直接更换会使旧密文无法解密。
+- NAS 数据库对已文档化的 FCM 字段使用显式、幂等迁移；Push Gateway 首版仍只有建表式初始化，没有通用旧 schema 迁移。两侧升级前都应备份对应数据库或 Docker volume。

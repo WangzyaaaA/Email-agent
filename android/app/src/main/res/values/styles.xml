@@ -1,0 +1,8 @@
+<resources>
+    <style name="Theme.MailSentinel" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="colorPrimary">#3157D5</item>
+        <item name="colorAccent">#3157D5</item>
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+</resources>

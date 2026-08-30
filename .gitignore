@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+/.tools/
+/android/.gradle/
+/android/.kotlin/
+/android/local.properties
+/android/**/build/
+/android/*.jks
+/android/*.keystore
+.venv/
+.env
+data/
+*.db
+*.sqlite3
+*.egg-info/

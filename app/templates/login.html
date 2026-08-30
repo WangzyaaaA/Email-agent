@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="auth-wrap"><div class="auth-card card">
+  <div class="auth-logo">✦</div><p class="eyebrow">安全登录</p><h1>欢迎回来</h1><p class="muted">登录邮箱管家管理台</p>
+  {% if error %}<div class="flash flash-error">{{ error }}</div>{% endif %}
+  <form method="post" action="{{ url_for('login_post') }}" class="stack-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token|default('') }}">
+    <label>管理员密码<input required type="password" name="password" autocomplete="current-password" autofocus></label>
+    <button class="button button-primary button-wide" type="submit">登录</button>
+  </form>
+</div></div>
+{% endblock %}

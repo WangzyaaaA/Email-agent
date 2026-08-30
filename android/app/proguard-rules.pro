@@ -1,0 +1,3 @@
+-keep class com.google.firebase.messaging.FirebaseMessagingService { *; }
+-keep class com.mailsentinel.push.MailMessagingService { *; }
+-keep class com.mailsentinel.push.BootReceiver { *; }

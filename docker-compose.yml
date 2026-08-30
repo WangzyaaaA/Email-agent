@@ -1,0 +1,20 @@
+services:
+  mail-sentinel:
+    build: .
+    container_name: mail-sentinel
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      EMAIL_AGENT_MASTER_KEY: "${EMAIL_AGENT_MASTER_KEY:?Set EMAIL_AGENT_MASTER_KEY in .env}"
+      EMAIL_AGENT_DATABASE_URL: "sqlite:////data/mail_sentinel.db"
+      EMAIL_AGENT_HOST: "0.0.0.0"
+      EMAIL_AGENT_PORT: "8080"
+      EMAIL_AGENT_TIMEZONE: "Asia/Shanghai"
+      EMAIL_AGENT_SECURE_COOKIES: "${EMAIL_AGENT_SECURE_COOKIES:-false}"
+      EMAIL_AGENT_LOG_LEVEL: "${EMAIL_AGENT_LOG_LEVEL:-INFO}"
+    volumes:
+      - mail-sentinel-data:/data
+
+volumes:
+  mail-sentinel-data:

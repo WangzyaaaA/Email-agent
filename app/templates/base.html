@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>{{ title|default('邮箱管家') }} · {{ app_name|default('邮箱管家') }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='styles.css') }}">
+</head>
+<body>
+  <div class="app-shell">
+    {% if current_user|default(false) %}
+    <aside class="sidebar" id="sidebar">
+      <div class="brand"><span class="brand-mark">✦</span><span>{{ app_name|default('邮箱管家') }}</span></div>
+      <nav class="nav" aria-label="主导航">
+        <a class="nav-link {% if active_nav|default('') == 'dashboard' %}active{% endif %}" href="{{ url_for('dashboard') }}"><span>⌂</span>总览</a>
+        <a class="nav-link {% if active_nav|default('') == 'mailboxes' %}active{% endif %}" href="{{ url_for('mailboxes') }}"><span>▣</span>邮箱</a>
+        <a class="nav-link {% if active_nav|default('') == 'otp' %}active{% endif %}" href="{{ url_for('otp_candidates') }}"><span>⌁</span>验证码</a>
+        <a class="nav-link {% if active_nav|default('') == 'actions' %}active{% endif %}" href="{{ url_for('actions') }}"><span>✓</span>待办事项</a>
+        <a class="nav-link {% if active_nav|default('') == 'notifications' %}active{% endif %}" href="{{ url_for('notifications') }}"><span>◔</span>通知记录</a>
+        <a class="nav-link {% if active_nav|default('') == 'push' %}active{% endif %}" href="{{ url_for('push_settings') }}"><span>⌁</span>Android 推送</a>
+        <a class="nav-link {% if active_nav|default('') == 'digests' %}active{% endif %}" href="{{ url_for('digests') }}"><span>▤</span>周期总结</a>
+        <div class="nav-divider"></div>
+        <a class="nav-link {% if active_nav|default('') == 'rules' %}active{% endif %}" href="{{ url_for('rules') }}"><span>⌘</span>规则</a>
+        <a class="nav-link {% if active_nav|default('') == 'settings' %}active{% endif %}" href="{{ url_for('settings') }}"><span>⚙</span>设置</a>
+      </nav>
+      <div class="sidebar-foot">
+        <span class="status-dot {% if system_status|default('ok') == 'ok' %}ok{% endif %}"></span>
+        <span>{{ system_status_label|default('服务运行正常') }}</span>
+      </div>
+    </aside>
+    {% endif %}
+    <main class="main-content {% if not current_user|default(false) %}full-width{% endif %}">
+      <header class="topbar">
+        {% if current_user|default(false) %}<button class="menu-toggle" type="button" aria-label="打开菜单" onclick="document.getElementById('sidebar').classList.toggle('open')">☰</button>{% endif %}
+        <div class="breadcrumbs">{{ breadcrumb|default(title|default('邮箱管家')) }}</div>
+        {% if current_user|default(false) %}
+        <div class="topbar-actions"><span class="muted small">{{ current_user|default('管理员') }}</span><form method="post" action="{{ url_for('logout') }}" class="inline-form"><input type="hidden" name="csrf_token" value="{{ csrf_token|default('') }}"><button class="button button-ghost button-small" type="submit">退出</button></form></div>
+        {% endif %}
+      </header>
+      <div class="page-container">
+        {% for message in flash_messages|default([]) %}<div class="flash flash-{{ message.type|default('info') }}" role="status">{{ message.text|default(message) }}</div>{% endfor %}
+        {% block content %}{% endblock %}
+      </div>
+    </main>
+  </div>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

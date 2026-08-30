@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="auth-wrap">
+  <div class="auth-card card">
+    <div class="auth-logo">✦</div><p class="eyebrow">首次启动</p><h1>配置你的邮箱管家</h1>
+    <p class="muted">连接邮箱后，我们会只读地整理邮件，不会删除、移动或发送任何邮件。</p>
+    {% if error %}<div class="flash flash-error">{{ error }}</div>{% endif %}
+    <form method="post" action="{{ url_for('setup_post') }}" class="stack-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token|default('') }}">
+      <h2>管理员账户</h2>
+      <label>登录密码<input required type="password" name="admin_password" minlength="12" autocomplete="new-password" placeholder="至少 12 位"></label>
+      <label>再次输入密码<input required type="password" name="admin_password_confirm" minlength="12" autocomplete="new-password"></label>
+      <h2>通知设置</h2>
+      <label>WxPusher AppToken<input type="password" name="wxpusher_app_token" autocomplete="off"></label>
+      <label>WxPusher UID<input type="text" name="wxpusher_uid" autocomplete="off"></label>
+      <input type="hidden" name="llm_base_url" value="">
+      <input type="hidden" name="llm_api_key" value="">
+      <input type="hidden" name="llm_model" value="">
+      <div class="form-actions"><button class="button button-primary" type="submit">保存并继续</button></div>
+    </form>
+    <p class="small muted">邮箱和模型配置可在进入管理台后继续完成。</p>
+  </div>
+</div>
+{% endblock %}
