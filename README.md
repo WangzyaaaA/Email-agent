@@ -35,6 +35,21 @@ WxPusher 是第三方通知服务。完整验证码会短暂经过 WxPusher；�
 
 Docker Compose 使用名为 `mail-sentinel-data` 的卷保存 SQLite 数据库。若需要从公网访问，必须在可信反向代理后启用 HTTPS，并设置 `EMAIL_AGENT_SECURE_COOKIES=true`；不建议直接暴露 8080 端口。
 
+### 更新 WSL 测试实例
+
+仓库根目录的 `update-wsl.sh` 用于更新独立的 `MailSentinel-Test` 测试实例。脚本会保留部署目录中的 `.env` 和 Docker 数据卷，并在同步代码前停止容器、复制卷内容、生成经过 SQLite 完整性检查的一致性备份。它只更新 NAS 应用，不会部署公网 Push Gateway 或自动切换通知主通道。
+
+首次使用时，在测试 WSL 中安装 `rsync`，然后从部署目录运行脚本：
+
+```bash
+apt-get update
+apt-get install -y rsync
+cd /opt/mail-sentinel-test
+./update-wsl.sh
+```
+
+脚本默认从 `/mnt/f/repos/email_agent` 读取最新版源码。若 Windows 仓库位于其他位置，可通过 `MAIL_SENTINEL_SOURCE_DIR` 指定对应的 WSL 挂载路径。升级备份保存在 `/opt/mail-sentinel-test/backups/pre-update-<UTC时间>/`。不要使用 `docker compose down -v`，否则会删除测试数据库卷。
+
 ## 邮箱准备
 
 ### QQ 邮箱
@@ -118,6 +133,8 @@ Docker Compose 使用名为 `mail-sentinel-data` 的卷保存 SQLite 数据库�
 
    `publisher` 只能发布和查询幂等状态；`device_admin` 只能预配、查询激活和吊销设备。轮换时使用 `python -m push_gateway.cli rotate publisher` 或 `rotate device_admin`，先验证新 Token，再用 `list` 查看旧凭据 ID，并以 `revoke <credential_id>` 停用旧版本。CLI 会拒绝停用某作用域的最后一个有效凭据。
 
+网关数据库使用显式 schema 版本基线。升级网关镜像前先停止网关应用，再运行 `docker compose run --rm gateway python -m push_gateway.cli upgrade`；命令会使用 SQLite 在线备份接口生成包含 WAL 已提交数据的一致性备份、执行完整性检查并输出 schema 版本。也可使用 `python -m push_gateway.cli backup` 单独生成经过检查的备份。不要通过删除数据库或 volume 完成升级。
+
 网关容器使用独立 SQLite 卷、非 root 用户、只读根文件系统和最小 capabilities。主密钥、Firebase 服务账号与数据库备份必须分开保存。ACK、过期或吊销会立即清除消息信封；无内容状态保留 7 天，防重放 nonce 只保留签名接受窗口。公网不启用 OpenAPI 文档。
 
 反向代理访问日志必须继续删除 Authorization、设备签名、nonce 和请求/响应体。`deploy/push-gateway/Caddyfile` 已包含相应过滤和 16 KiB 请求上限。网关应用端口不映射到公网。
@@ -163,7 +180,7 @@ MAIL_SENTINEL_KEY_PASSWORD
 
 未提供签名配置时只生成未签名 release 产物，不能视为正式发布包。debug APK、测试 Firebase 项目和测试网关不得复用生产凭据。
 
-App 使用 Android Keystore 中不可导出的 AES 包装密钥加密 content root key、device token 和 FCM 登记标识；当前 Firebase SDK 使用 FID 模式（`register` / `onRegistered`），不调用已弃用的 Token 获取接口。私有凭据、密文数据库和去重记录全部排除在 Auto Backup 与设备迁移之外。Android 13+ 会在解释用途后请求通知权限。验证码与安全告警默认使用锁屏隐藏的敏感通知；用户可显式开启预览，但通知历史、截图和辅助功能风险会增加。
+App 使用 Android Keystore 中不可导出的 AES 包装密钥加密 content root key、device token 和 FCM 登记标识；当前 Firebase SDK 使用 FID 模式（`register` / `onRegistered`），不调用已弃用的 Token 获取接口。私有凭据、密文数据库和去重记录全部排除在 Auto Backup 与设备迁移之外。本地密文表以 message ID 唯一约束和短处理租约协调 FCM 接收与 pending 同步；同一消息只有取得租约的任务可以解密和展示，任务中断后可在租约过期时恢复。Android 13+ 会在解释用途后请求通知权限。验证码与安全告警默认使用锁屏隐藏的敏感通知；用户可显式开启预览，但通知历史、截图和辅助功能风险会增加。
 
 ### 网关故障排查
 
@@ -207,4 +224,4 @@ $env:EMAIL_AGENT_MASTER_KEY = python -c "import secrets; print(secrets.token_url
 - NAS 与公网网关都使用各自的单个应用实例和单个 Uvicorn worker；两者使用独立进程、配置前缀、数据库、卷和容器镜像。
 - WxPusher 的 HTTP 接口不提供业务幂等键。极端情况下，如果进程在第三方已接收消息、但本地提交状态前崩溃，租约恢复可能造成一次重复通知，系统优先保证不漏告警。
 - 修改主密钥前应先在管理台重新准备所有外部凭据；直接更换会使旧密文无法解密。
-- NAS 数据库对已文档化的 FCM 字段使用显式、幂等迁移；Push Gateway 首版仍只有建表式初始化，没有通用旧 schema 迁移。两侧升级前都应备份对应数据库或 Docker volume。
+- NAS 数据库对已文档化的 FCM 字段使用显式、幂等迁移；Push Gateway 使用版本化 schema 基线、结构校验和带完整性检查的 SQLite 备份命令，未来修改已有网关表时仍必须增加对应版本迁移。两侧升级前都应备份对应数据库或 Docker volume。

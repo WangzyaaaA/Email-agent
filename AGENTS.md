@@ -12,6 +12,8 @@ Mail Sentinel 是运行在家庭 NAS 上的只读邮箱智能 Agent。当前首�
 - FastAPI 中文局域网管理页面。
 - SQLite 持久化、Docker Compose 部署和可选 OpenAI 兼容分类接口。
 - 独立公网 Push Gateway、Android App、设备配对/吊销、可靠 ACK 与补偿同步。
+- Android 本地密文库已升级到 schema v2，并使用短时处理租约协调 FCM 回调与补偿同步，避免并发重复解密和展示。
+- Push Gateway 已建立 schema v1 版本基线、结构校验、WAL 一致备份和升级前自动备份流程。
 
 不要把钉邮当作独立邮箱服务器。钉邮只是客户端；实时收件应连接阿里企业邮箱或该账号实际使用的 IMAP 服务商。
 
@@ -68,11 +70,12 @@ Mail Sentinel 是运行在家庭 NAS 上的只读邮箱智能 Agent。当前首�
 - `app/scheduler.py`：后台定时任务。
 - `app/templates/`、`app/static/`：轻量中文管理页面。
 - `push_gateway/`：独立 FastAPI 公网密文转发网关、作用域凭据、设备 API、FCM HTTP v1、队列与本地运维 CLI。
+- `push_gateway/migrations.py`：网关 schema v1 基线、已有表结构校验、版本记录和带完整性检查的 SQLite 在线备份。
 - `deploy/push-gateway/`：独立网关 Compose、Caddy 安全边界、Secret 占位和运维说明。
-- `android/`：API 26+ Kotlin App，包含 Keystore、FID 登记、FCM 接收、本地密文存储、隐私通知、WorkManager ACK/同步和 Gradle Wrapper。
+- `android/`：API 26+ Kotlin App，包含 Keystore、FID 登记、FCM 接收、本地密文 SQLite v2、短时处理租约、隐私通知、WorkManager ACK/同步和 Gradle Wrapper。
 - `protocol_vectors.json`：Python/Kotlin 共用的密码学黄金向量；修改协议时必须同步更新两端测试。
 - `ANDROID_FCM_PUSH_DESIGN.md`：自建推送的完整安全设计、状态机、协议和验收矩阵。
-- `tests/`：规则、解析器、IMAP、流水线、通知、摘要、推送协议、网关、迁移和 Android 安全回归测试。
+- `tests/`：规则、解析器、IMAP、流水线、通知、摘要、推送协议、网关迁移/备份、运维状态和 Android 安全回归测试。
 
 ## 核心行为
 
@@ -109,7 +112,8 @@ Mail Sentinel 是运行在家庭 NAS 上的只读邮箱智能 Agent。当前首�
 - 每条通知只生成一次冻结的 AES-256-GCM 信封；正常重试复用相同 nonce、AAD 和 ciphertext。同一幂等键对应不同信封必须返回冲突。
 - 网关持久化 `accepted / retry_wait / fcm_accepted / waiting_registration / acknowledged / expired / revoked / permanent_failed` 等状态，使用 `lease_until`、持久化重试时间和单进程锁恢复投递。
 - FCM 只发送 data message。当前 Android SDK 使用 Firebase Installation ID（FID）的 `register` / `onRegistered`；首版 JSON 字段仍保留兼容名 `fcm_token`。
-- App 先把消息 ID、有效期和端到端密文事务性落到私有 SQLite，再显示通知并异步 ACK；重复消息由唯一 message ID 去重。
+- App 先把消息 ID、有效期和端到端密文事务性落到私有 SQLite v2，再通过唯一 message ID 和原子短时 `claim_until` 租约取得处理权；只有租约持有者可以解密和显示通知。
+- FCM 回调与 pending 同步发生竞争时，不得把“未取得租约”误判为已处理或发送 ACK；竞争方应延后重试，进程中断后由租约过期恢复处理。
 - `onDeletedMessages`、网络恢复、启动和重启后使用有页数上限的 pending 同步补偿；不得通过高频轮询、自建长连接或前台服务补偿。
 - App 报告 `shown`、`stored_notifications_disabled` 或 `expired` 后，网关清除消息信封。通知权限关闭、设备离线或未 ACK 不触发 NAS 的 WxPusher 回退。
 - 配对、测试、通道切换和吊销均为管理写操作，必须使用 POST、登录会话、CSRF；创建配对和吊销还需管理员密码重新认证与明确确认。
@@ -122,7 +126,10 @@ Mail Sentinel 是运行在家庭 NAS 上的只读邮箱智能 Agent。当前首�
 - 网关只保存最小路由元数据、带密钥指纹、加密的设备认证密钥/FCM 登记标识和二次加密的端到端信封；不得保存 content root key 或通知明文。
 - 元数据、摘要、行动项和通知默认保留 90 天；审计记录当前保留 30 天。
 - NAS 启动会先执行 `Base.metadata.create_all()`，再运行 `app.migrations.upgrade_schema()`，当前只覆盖已文档化的 FCM 通知字段迁移。未来修改现有表必须同步扩展显式迁移、回滚、备份、模型、测试和 README；不得假设 `create_all()` 会修改旧表。
-- Push Gateway 首版仍仅使用 `GatewayBase.metadata.create_all()`，没有通用迁移框架。修改网关现有表时必须提供独立升级/恢复方案，不能删除数据库或卷完成升级。
+- Push Gateway 使用显式 schema 版本基线、结构校验和带完整性检查的 SQLite 备份命令。修改网关现有表时必须增加独立的版本迁移、升级前备份与恢复测试，不能假设 `create_all()` 会修改旧表，也不能删除数据库或卷完成升级。
+- `gateway_schema_migrations` 只记录版本和应用时间，不得保存凭据或密文；运维升级使用 `python -m push_gateway.cli upgrade`，该命令必须在变更 schema 前生成并校验备份，单独备份使用 `python -m push_gateway.cli backup`。
+- 网关运维统计必须与服务端真实状态名保持一致；`fcm_accepted` 只表示 FCM 已接受，在设备 ACK、过期或最终失败前仍属于待完成消息。
+- Android 本地消息表当前为 schema v2，`claim_until` 只保存处理租约时间，不得保存通知明文；后续修改 schema 必须递增版本、实现非破坏性 `onUpgrade` 并保留已有密文与去重状态。
 - 处理并发唯一冲突时使用 nested transaction/savepoint，不能因单封重复邮件回滚同批次其他工作。
 
 ## 开发约定
@@ -138,6 +145,8 @@ Mail Sentinel 是运行在家庭 NAS 上的只读邮箱智能 Agent。当前首�
 - 保留用户已有配置和数据。不要在开发或测试中删除真实 `data/`、`.env` 或 Docker volume。
 - 修改推送协议时，必须同步更新 `app/push_protocol.py`、Android Kotlin 实现、`protocol_vectors.json`、Python/Kotlin 测试和 `ANDROID_FCM_PUSH_DESIGN.md`。
 - Android 当前使用 compile SDK 37.1、target SDK 36、min SDK 26、AGP 9.3.2 和 Gradle 9.5。不要把 Firebase 服务账号放进 App，也不要提交 Firebase 标识、release keystore 或签名密码。
+- Android 消息处理顺序必须保持“密文持久化 → 取得处理租约 → 解密/展示 → 标记完成 → 异步 ACK”；任何改动都要覆盖并发竞争、租约过期恢复和旧 schema 升级测试。
+- 当前 App 有意使用 FID `register` / `onRegistered`，`MailMessagingService` 上的 `MissingFirebaseInstanceTokenRefresh` 抑制由静态回归测试保护；除非同步修改登记协议、SDK 行为和两端测试，否则不要改回 token 刷新路径。
 - Android 正式包只能使用用户离线保管的 release keystore。未配置 Firebase 项目标识或只生成 unsigned/debug APK 时，不得描述为可生产侧载包。
 
 ## 本地验证
@@ -162,7 +171,14 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip check
 ```
 
-当前 Python 基线为 87 项测试通过。修改以下区域时至少增加对应回归测试：
+当前本地验证基线（2026-09-02）：
+
+- Python 完整测试为 96 项通过；`compileall` 与 `pip check` 通过。
+- Android `testDebugUnitTest`、Debug/Release 构建、Debug/Release Lint 和 `assembleDebugAndroidTest` 通过。
+- Android Lint 当前为 0 个错误、11 个警告；未连接真机或模拟器，因此仪器测试只完成 APK 编译，未执行 `connectedDebugAndroidTest`。
+- 当前未配置用户 Firebase 项目标识和 release keystore；Release 结果仅为 unsigned 构建验证，不是可生产侧载包。
+
+修改以下区域时至少增加对应回归测试：
 
 - OTP 正则、白名单或认证头信任逻辑。
 - IMAP BODYSTRUCTURE、section 限制、checkpoint 或 UID 去重。
@@ -172,9 +188,10 @@ python -m venv .venv
 - MX/CNAME 服务商识别与阿里邮箱故障分类。
 - 推送 HKDF/AAD/AES-GCM/HMAC、载荷上限、冻结信封和 Python/Kotlin 黄金向量。
 - 网关凭据作用域、预配顺序、防重放、幂等冲突、FCM 错误分类、租约、ACK、清理和状态指标。
+- 网关 schema 版本基线、已有数据保留、WAL 一致备份、完整性检查、不完整 schema 拒绝启动和运维状态名。
 - FCM 主通道冻结、提交不确定性查询、紧急类别回退、吊销重试和旧密钥消息处理。
 - SQLite 升级/回滚、旧数据保留、升级前备份和已有表字段补齐。
-- Android Manifest 权限、系统 CA、备份排除、Keystore、FID 登记、本地密文 schema、通知隐私与无邮箱控制接口。
+- Android Manifest 权限、系统 CA、备份排除、Keystore、FID 登记、本地密文 schema v1→v2、处理租约竞争/恢复、通知隐私与无邮箱控制接口。
 
 Android 验证（需已安装相应 SDK；设备测试执行还需要物理设备或模拟器）：
 
@@ -202,11 +219,15 @@ Set-Location android
 8. 推送改动保持 NAS 只出站、网关不见明文、Android 无管理能力，且三种接受/送达状态没有混淆。
 9. ACK、过期、吊销和最终失败后的密文清理路径已验证；紧急回退类别没有扩大。
 10. 若修改 Android，单元测试、Lint 和相关 APK 构建通过；没有真机时明确标注仪器测试仅完成编译。
+11. 若修改 Android 消息接收或本地数据库，验证持久化先于解密/展示、并发处理只有一个租约持有者、租约过期可恢复且旧数据不丢失。
+12. 若修改 Push Gateway 表结构或消息状态，提供版本迁移、升级前备份/恢复测试，并同步 CLI 统计、部署文档和状态语义。
 
 ## 已知限制与后续方向
 
 - 尚未使用真实 QQ、Gmail、阿里企业邮箱和 WxPusher 凭据完成联调。
-- 尚未使用用户自己的 Firebase 项目、公网域名和物理 Android 设备完成端到端推送联调，也没有用户正式签名的 release APK。
+- 尚未使用用户自己的 Firebase 项目、公网域名和物理 Android 设备完成端到端推送联调，也没有用户正式签名的 release APK；当前仅完成 JVM 单元测试、静态安全回归、Lint、APK 构建和仪器测试 APK 编译。
+- 首版仍只支持单台 Android 设备；FCM 可达性依赖设备上的 Google Play 服务与网络环境，目前没有真实设备送达时延或可靠性基线。
+- Push Gateway 当前迁移能力是 schema v1 基线、结构校验和备份框架；尚无实际的 v1→v2 表结构迁移，首次新增或修改已有列时必须实现新版本迁移，不能把现有框架描述为通用自动迁移。
 - 当前环境未安装 Docker，因此 Dockerfile/Compose 只做过静态校验。
 - Gmail OAuth、阿里邮箱 MCP、钉钉机器人、日程/待办写入、回复草稿与发送均不在首版范围。
 - 后续可增加账单/订单/快递/票务卡片、营销邮件聚合与退订建议、钓鱼和仿冒域名检测、语义搜索与附件 OCR。
