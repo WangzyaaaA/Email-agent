@@ -52,4 +52,18 @@ class PrivateStorageInstrumentedTest {
         assertFalse(row.envelopeJson!!.contains("notification title"))
         assertNotEquals("gateway_0123456789", envelope.ciphertext)
     }
+
+    @Test
+    fun messageProcessingClaimIsExclusiveAndRecoversAfterLeaseExpiry() {
+        val envelope = Envelope(
+            "1", "message_lease_012345", "device_0123456789", "key_0123456789", "high",
+            "2030-01-01T00:10:00Z", Crypto.b64Encode(ByteArray(12) { 1 }), Crypto.b64Encode(ByteArray(32) { 2 })
+        )
+        val store = MessageStore(context)
+        assertTrue(store.claimForProcessing("gateway_lease_012345", envelope, nowEpoch = 100, leaseSeconds = 120))
+        assertFalse(store.claimForProcessing("gateway_lease_012345", envelope, nowEpoch = 100, leaseSeconds = 120))
+        assertTrue(store.claimForProcessing("gateway_lease_012345", envelope, nowEpoch = 221, leaseSeconds = 120))
+        store.markProcessed(envelope.messageId, false, "stored_notifications_disabled")
+        assertFalse(store.claimForProcessing("gateway_lease_012345", envelope, nowEpoch = 400, leaseSeconds = 120))
+    }
 }

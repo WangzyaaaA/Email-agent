@@ -17,7 +17,7 @@ data class LocalMessage(
     val acknowledged: Boolean,
 )
 
-class MessageStore(context: Context) : SQLiteOpenHelper(context, "encrypted_messages.db", null, 1) {
+class MessageStore(context: Context) : SQLiteOpenHelper(context, "encrypted_messages.db", null, 2) {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
             """CREATE TABLE messages (
@@ -28,6 +28,7 @@ class MessageStore(context: Context) : SQLiteOpenHelper(context, "encrypted_mess
                 shown INTEGER NOT NULL DEFAULT 0,
                 ack_result TEXT,
                 acknowledged INTEGER NOT NULL DEFAULT 0,
+                claim_until INTEGER,
                 created_at INTEGER NOT NULL
             )""".trimIndent()
         )
@@ -35,7 +36,9 @@ class MessageStore(context: Context) : SQLiteOpenHelper(context, "encrypted_mess
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        throw IllegalStateException("unsupported_local_schema")
+        if (oldVersion < 2) {
+            db.execSQL("ALTER TABLE messages ADD COLUMN claim_until INTEGER")
+        }
     }
 
     fun find(messageId: String): LocalMessage? {
@@ -68,10 +71,40 @@ class MessageStore(context: Context) : SQLiteOpenHelper(context, "encrypted_mess
         }
     }
 
+    fun claimForProcessing(
+        gatewayMessageId: String,
+        envelope: Envelope,
+        nowEpoch: Long = Instant.now().epochSecond,
+        leaseSeconds: Long = 120,
+    ): Boolean {
+        val leaseUntil = nowEpoch + leaseSeconds
+        val values = ContentValues().apply {
+            put("message_id", envelope.messageId)
+            put("gateway_message_id", gatewayMessageId)
+            put("envelope", envelope.toJson().toString())
+            put("expires_at", Instant.parse(envelope.expiresAt).epochSecond)
+            put("shown", 0)
+            put("claim_until", leaseUntil)
+            put("created_at", nowEpoch)
+        }
+        val db = writableDatabase
+        if (db.insertWithOnConflict("messages", null, values, SQLiteDatabase.CONFLICT_IGNORE) != -1L) {
+            return true
+        }
+        val lease = ContentValues().apply { put("claim_until", leaseUntil) }
+        return db.update(
+            "messages",
+            lease,
+            "message_id=? AND ack_result IS NULL AND (claim_until IS NULL OR claim_until<=?)",
+            arrayOf(envelope.messageId, nowEpoch.toString()),
+        ) == 1
+    }
+
     fun markProcessed(messageId: String, shown: Boolean, result: String) {
         val values = ContentValues().apply {
             put("shown", if (shown) 1 else 0)
             put("ack_result", result)
+            putNull("claim_until")
         }
         writableDatabase.update("messages", values, "message_id=?", arrayOf(messageId))
     }

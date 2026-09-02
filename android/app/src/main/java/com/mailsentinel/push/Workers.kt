@@ -118,10 +118,15 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
         try {
             var cursor: String? = null
             var pages = 0
+            var retryNeeded = false
             do {
                 val page = api.pending(cursor)
                 for ((gatewayId, envelope) in page.items) {
                     val result = processor.process(gatewayId, envelope)
+                    if (result == null) {
+                        retryNeeded = true
+                        continue
+                    }
                     WorkScheduling.acknowledge(applicationContext, result.messageId, result.highPriority)
                 }
                 cursor = page.nextCursor
@@ -134,7 +139,7 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
             for (row in MessageStore(applicationContext).unacknowledged()) {
                 WorkScheduling.acknowledge(applicationContext, row.messageId, false)
             }
-            Result.success()
+            if (retryNeeded) Result.retry() else Result.success()
         } catch (exc: GatewayApiException) {
             if (exc.code in setOf("invalid_device_credentials", "device_mismatch")) {
                 clearRevokedState(applicationContext)

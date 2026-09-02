@@ -31,6 +31,7 @@ def test_android_private_data_is_excluded_from_backup_and_local_schema_has_no_pl
     schema = store.split("CREATE TABLE messages", 1)[1].split('"""', 1)[0]
     assert "title" not in schema and "body" not in schema and "content_root_key" not in schema and "device_token" not in schema
     assert "envelope TEXT" in schema
+    assert "claim_until INTEGER" in schema
 
 
 def test_android_uses_fcm_keystore_workmanager_and_has_no_mail_control_or_long_lived_transport() -> None:
@@ -39,6 +40,17 @@ def test_android_uses_fcm_keystore_workmanager_and_has_no_mail_control_or_long_l
     assert "onRegistered" in sources
     assert "onNewToken" not in sources
     assert "getInstance().token" not in sources
+    assert '@SuppressLint("MissingFirebaseInstanceTokenRefresh")' in sources
     assert "AndroidKeyStore" in sources
     assert "WorkManager" in sources
     assert all(value not in sources.lower() for value in ["wss://", "ws://", "startforeground(", "imap", "smtp", "delete email", "mark as read"])
+
+
+def test_android_claims_ciphertext_before_decrypting_or_displaying_and_retries_contention() -> None:
+    processor = (ANDROID / "java" / "com" / "mailsentinel" / "push" / "MessageProcessor.kt").read_text(encoding="utf-8")
+    worker = (ANDROID / "java" / "com" / "mailsentinel" / "push" / "Workers.kt").read_text(encoding="utf-8")
+    receiver = (ANDROID / "java" / "com" / "mailsentinel" / "push" / "MailMessagingService.kt").read_text(encoding="utf-8")
+    assert processor.index("claimForProcessing") < processor.index("Crypto.decrypt") < processor.index("NotificationHelper.show")
+    assert "fun process(gatewayMessageId: String, envelope: Envelope): ProcessResult?" in processor
+    assert "if (result == null)" in worker and "retryNeeded = true" in worker
+    assert "if (result == null)" in receiver and "WorkScheduling.sync(applicationContext)" in receiver

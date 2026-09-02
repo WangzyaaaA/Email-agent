@@ -9,25 +9,24 @@ class MessageProcessor(private val context: Context) {
     private val credentials = CredentialStore(context)
     private val messages = MessageStore(context)
 
-    fun process(gatewayMessageId: String, envelope: Envelope): ProcessResult {
-        val existing = messages.find(envelope.messageId)
-        if (existing?.ackResult != null) {
-            return ProcessResult(envelope.messageId, existing.ackResult, envelope.priority == "high")
+    fun process(gatewayMessageId: String, envelope: Envelope): ProcessResult? {
+        if (!messages.claimForProcessing(gatewayMessageId, envelope)) {
+            val existing = messages.find(envelope.messageId)
+            return existing?.ackResult?.let {
+                ProcessResult(envelope.messageId, it, envelope.priority == "high")
+            }
         }
         val state = credentials.load() ?: throw IllegalStateException("pairing_required")
         if (!Instant.parse(envelope.expiresAt).isAfter(Instant.now())) {
-            messages.insertIfAbsent(gatewayMessageId, envelope)
             messages.markProcessed(envelope.messageId, false, "expired")
             return ProcessResult(envelope.messageId, "expired", envelope.priority == "high")
         }
         val plain = try {
             Crypto.decrypt(state.pairing, envelope)
         } catch (_: Exception) {
-            messages.insertIfAbsent(gatewayMessageId, envelope)
             messages.markProcessed(envelope.messageId, false, "decrypt_failed")
             return ProcessResult(envelope.messageId, "decrypt_failed", envelope.priority == "high")
         }
-        messages.insertIfAbsent(gatewayMessageId, envelope)
         val shown = NotificationHelper.show(context, envelope.messageId, plain)
         val result = if (shown) "shown" else "stored_notifications_disabled"
         messages.markProcessed(envelope.messageId, shown, result)
