@@ -35,8 +35,10 @@ def create_session_factory(engine: Engine) -> sessionmaker[Session]:
 
 def init_gateway_db(engine: Engine) -> None:
     from push_gateway import models  # noqa: F401
+    from push_gateway.migrations import upgrade_schema
 
     GatewayBase.metadata.create_all(engine)
+    upgrade_schema(engine)
 
 
 def session_dependency(factory: sessionmaker[Session]):

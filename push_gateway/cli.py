@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from push_gateway.config import get_gateway_settings
 from push_gateway.database import create_gateway_engine, create_session_factory, init_gateway_db
+from push_gateway.migrations import backup_database, schema_version
 from push_gateway.models import Device, GatewayCredential, GatewayMessage, OperationalEvent, utcnow
 from push_gateway.security import GatewayCipher, new_token
 
@@ -17,7 +18,7 @@ def operational_status_lines(db: Session, *, now: datetime | None = None) -> lis
     current = now or utcnow()
     device_counts = dict(db.execute(select(Device.status, func.count()).group_by(Device.status)).all())
     message_counts = dict(db.execute(select(GatewayMessage.status, func.count()).group_by(GatewayMessage.status)).all())
-    pending_statuses = ("accepted", "retrying", "leased", "waiting_registration")
+    pending_statuses = ("accepted", "retry_wait", "waiting_registration", "fcm_accepted")
     oldest = db.scalar(select(func.min(GatewayMessage.created_at)).where(GatewayMessage.status.in_(pending_statuses)))
     if oldest is None:
         oldest_age = 0
@@ -50,12 +51,23 @@ def main() -> None:
     rotate.add_argument("scope", choices=("publisher", "device_admin"))
     subparsers.add_parser("list", help="List credential metadata without revealing tokens")
     subparsers.add_parser("status", help="Print aggregate delivery health without identifiers or payloads")
+    subparsers.add_parser("backup", help="Create and integrity-check a consistent SQLite backup")
+    subparsers.add_parser("upgrade", help="Back up, verify and record the current gateway schema version")
     revoke = subparsers.add_parser("revoke", help="Deactivate an old credential after its replacement is verified")
     revoke.add_argument("credential_id", type=int)
     args = parser.parse_args()
 
     settings = get_gateway_settings()
+    if args.command == "backup":
+        print(f"backup={backup_database(settings.database_url)}")
+        return
     engine = create_gateway_engine(settings)
+    if args.command == "upgrade":
+        backup = backup_database(settings.database_url)
+        init_gateway_db(engine)
+        print(f"backup={backup}")
+        print(f"schema_version={schema_version(engine)}")
+        return
     init_gateway_db(engine)
     factory = create_session_factory(engine)
     cipher = GatewayCipher(settings.master_key)
