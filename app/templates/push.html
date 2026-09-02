@@ -1,10 +1,79 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="page-heading"><div><p class="eyebrow">端到端加密</p><h1>Android FCM 推送</h1><p class="muted">NAS 只向公网网关提交应用层密文；网关与 FCM 都无法读取通知内容。</p></div></div>
+<div class="page-stack">
 {% if error %}<div class="flash flash-error">{{ error }}</div>{% endif %}
 {% if pairing_qr %}<section class="card panel"><div class="panel-heading"><div><h2>一次性配对二维码</h2><p class="muted">请在 {{ pairing_expires_at }} 前用 Mail Sentinel Android 扫描。离开页面后不会再次显示。</p></div><span class="badge badge-warning">包含完整设备凭据</span></div><div class="pairing-grid"><img src="{{ pairing_qr }}" alt="Android 配对二维码" width="280" height="280"><details><summary>无法扫码时显示一次性配置</summary><textarea readonly rows="10">{{ pairing_payload }}</textarea></details></div></section>{% endif %}
-<section class="card panel"><div class="panel-heading"><h2>公网网关</h2><span class="badge badge-{{ 'ok' if configured.publisher and configured.device_admin else 'warning' }}">{{ '凭据已配置' if configured.publisher and configured.device_admin else '待配置' }}</span></div><form method="post" action="{{ url_for('push_configure') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="form-grid"><label>HTTPS 网关地址<input type="url" name="gateway_url" required value="{{ configured.gateway_url }}" placeholder="https://push.example.com"></label><label>Publisher Token<input type="password" name="publisher_token" placeholder="留空表示不修改"></label><label>Device Admin Token<input type="password" name="device_admin_token" placeholder="留空表示不修改"></label></div><p class="form-help">两类 Token 由网关主机上的离线初始化命令生成，作用域互不混用。</p><button class="button button-primary" type="submit">保存网关配置</button></form></section>
-<section class="card panel"><div class="panel-heading"><h2>设备</h2>{% if device %}<span class="badge badge-{{ 'ok' if device.status == 'active' else 'warning' }}">{{ device.status }}</span>{% endif %}</div>{% if not device or device.status in ['revoked','pairing_expired'] %}<form method="post" action="{{ url_for('push_pair') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>重新验证管理员密码<input type="password" name="admin_password" required autocomplete="current-password"></label><button class="button button-primary" type="submit">创建十分钟配对二维码</button></form>{% elif device.status == 'pending_activation' %}<p>二维码已预配，等待 App 登记 FCM Token。若已扫码，请检查激活状态。</p><form method="post" action="{{ url_for('push_check_activation') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button button-secondary" type="submit">检查激活状态</button></form>{% else %}<p>设备标识：{{ device.device_id }}<br>密钥版本：{{ device.key_id }}</p>{% endif %}</section>
-<section class="card panel"><div class="panel-heading"><h2>主通知通道</h2><span class="badge badge-muted">新通知入队时冻结</span></div><form method="post" action="{{ url_for('push_channel') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="form-grid"><label><input type="radio" name="channel" value="wxpusher" {% if notification_channel == 'wxpusher' %}checked{% endif %}> WxPusher</label><label><input type="radio" name="channel" value="fcm_gateway" {% if notification_channel == 'fcm_gateway' %}checked{% endif %}> 自建 Android FCM</label><label class="check-label"><input type="checkbox" name="confirm" value="yes" required>确认只切换后续入队通知；旧通知路线不改变</label></div><button class="button button-primary" type="submit">切换主通道</button></form><form method="post" action="{{ url_for('push_test') }}" class="inline-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button button-secondary" type="submit">发送无敏感内容的测试通知</button></form></section>
-{% if device and device.status not in ['revoked','pairing_expired'] %}<section class="card panel danger-zone"><div class="panel-heading"><h2>吊销设备</h2></div><p>吊销会立即停用自建通道，并要求网关删除 FCM Token、认证密钥和未确认密文。网关离线时会持续重试。</p><form method="post" action="{{ url_for('push_revoke') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>管理员密码<input type="password" name="admin_password" required autocomplete="current-password"></label><label class="check-label"><input type="checkbox" name="confirm" value="revoke" required>确认吊销并作废全部旧设备凭据</label><button class="button button-danger" type="submit">吊销设备</button></form></section>{% endif %}
+<section class="card panel"><div class="panel-heading"><h2>公网网关</h2><span class="badge badge-{{ 'ok' if configured.publisher and configured.device_admin else 'warning' }}">{{ '凭据已配置' if configured.publisher and configured.device_admin else '待配置' }}</span></div><form method="post" action="{{ url_for('push_configure') }}" class="panel-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="form-grid gateway-form-grid"><label>HTTPS 网关地址<input type="url" name="gateway_url" required value="{{ configured.gateway_url }}" placeholder="https://push.example.com"></label><label>Publisher Token<input type="password" name="publisher_token" placeholder="留空表示不修改"></label><label>Device Admin Token<input type="password" name="device_admin_token" placeholder="留空表示不修改"></label></div><p class="form-help">两类 Token 由网关主机上的离线初始化命令生成，作用域互不混用。</p><button class="button button-primary" type="submit">保存网关配置</button></form></section>
+<section class="card panel"><div class="panel-heading"><h2>设备</h2>{% if device %}<span class="badge badge-{{ 'ok' if device.status == 'active' else 'warning' }}">{{ device.status }}</span>{% endif %}</div>{% if not device or device.status in ['revoked','pairing_expired'] %}<form method="post" action="{{ url_for('push_pair') }}" class="panel-form narrow-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>重新验证管理员密码<input type="password" name="admin_password" required autocomplete="current-password"></label><button class="button button-primary" type="submit">创建十分钟配对二维码</button></form>{% elif device.status == 'pending_activation' %}<p>二维码已预配，等待 App 登记 FCM Token。若已扫码，请检查激活状态。</p><form method="post" action="{{ url_for('push_check_activation') }}" class="panel-form narrow-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button button-secondary" type="submit">检查激活状态</button></form>{% else %}<p>设备标识：{{ device.device_id }}<br>密钥版本：{{ device.key_id }}</p>{% endif %}</section>
+<section class="card panel channel-panel">
+  <div class="panel-heading channel-panel-heading">
+    <div>
+      <h2>主通知通道</h2>
+      <p class="muted">每条通知只走一个通道，选择仅影响后续新入队的通知。</p>
+    </div>
+    <span class="badge badge-muted">入队时锁定路线</span>
+  </div>
+  <form method="post" action="{{ url_for('push_channel') }}" class="channel-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <fieldset class="channel-options">
+      <legend class="visually-hidden">选择主通知通道</legend>
+      <label class="channel-choice">
+        <input class="channel-choice-input" type="radio" name="channel" value="wxpusher" {% if notification_channel == 'wxpusher' %}checked{% endif %} {% if not wxpusher_configured %}disabled{% endif %}>
+        <span class="channel-choice-card">
+          <span class="channel-choice-icon" aria-hidden="true">W</span>
+          <span class="channel-choice-copy">
+            <span class="channel-choice-title">
+              <strong>WxPusher</strong>
+              {% if notification_channel == 'wxpusher' %}<span class="badge badge-ok">当前通道</span>{% endif %}
+            </span>
+            <span class="channel-choice-description">第三方通知服务，适合作为默认或紧急回退通道。</span>
+            <span class="channel-choice-status {% if wxpusher_configured %}is-ready{% else %}is-unavailable{% endif %}">
+              <span class="status-dot {% if wxpusher_configured %}ok{% endif %}"></span>
+              {{ '已配置，可切换' if wxpusher_configured else '尚未配置，请先在设置中填写凭据' }}
+            </span>
+          </span>
+          <span class="channel-choice-indicator" aria-hidden="true"></span>
+        </span>
+      </label>
+      <label class="channel-choice">
+        <input class="channel-choice-input" type="radio" name="channel" value="fcm_gateway" {% if notification_channel == 'fcm_gateway' %}checked{% endif %} {% if not device or device.status != 'active' %}disabled{% endif %}>
+        <span class="channel-choice-card">
+          <span class="channel-choice-icon channel-choice-icon-fcm" aria-hidden="true">A</span>
+          <span class="channel-choice-copy">
+            <span class="channel-choice-title">
+              <strong>自建 Android FCM</strong>
+              {% if notification_channel == 'fcm_gateway' %}<span class="badge badge-ok">当前通道</span>{% endif %}
+            </span>
+            <span class="channel-choice-description">端到端加密，经自建网关投递到已配对的 Android 设备。</span>
+            <span class="channel-choice-status {% if device and device.status == 'active' %}is-ready{% else %}is-unavailable{% endif %}">
+              <span class="status-dot {% if device and device.status == 'active' %}ok{% endif %}"></span>
+              {% if device and device.status == 'active' %}设备已激活，可切换{% elif device %}设备尚未激活{% else %}尚未创建配对设备{% endif %}
+            </span>
+          </span>
+          <span class="channel-choice-indicator" aria-hidden="true"></span>
+        </span>
+      </label>
+    </fieldset>
+    <div class="channel-submit-row">
+      <label class="check-label channel-confirm">
+        <input type="checkbox" name="confirm" value="yes" required>
+        <span><strong>确认切换后续通知</strong><small>已入队通知继续按原路线投递，不会自动双发。</small></span>
+      </label>
+      <button class="button button-primary" type="submit">保存主通道</button>
+    </div>
+  </form>
+  <div class="channel-test-row">
+    <div>
+      <strong>验证当前通道</strong>
+      <p class="muted">发送一条不含邮件内容或验证码的测试通知。</p>
+    </div>
+    <form method="post" action="{{ url_for('push_test') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="button button-secondary" type="submit">发送测试通知</button>
+    </form>
+  </div>
+</section>
+{% if device and device.status not in ['revoked','pairing_expired'] %}<section class="card panel danger-zone"><div class="panel-heading"><h2>吊销设备</h2></div><p>吊销会立即停用自建通道，并要求网关删除 FCM Token、认证密钥和未确认密文。网关离线时会持续重试。</p><form method="post" action="{{ url_for('push_revoke') }}" class="panel-form narrow-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>管理员密码<input type="password" name="admin_password" required autocomplete="current-password"></label><label class="check-label"><input type="checkbox" name="confirm" value="revoke" required>确认吊销并作废全部旧设备凭据</label><button class="button button-danger" type="submit">吊销设备</button></form></section>{% endif %}
+</div>
 {% endblock %}
