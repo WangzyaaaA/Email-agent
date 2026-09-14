@@ -42,20 +42,27 @@ def run_action_reminders(db: Session) -> int:
                 item.followup_sent = True
                 count += 1
             continue
-        if remaining <= timedelta(hours=2) and not item.reminder_2_sent:
-            enqueue_notification(
-                db,
-                kind="deadline",
-                priority="critical",
-                title=f"即将到期：{item.title}",
-                html_content=f"<h2>{html.escape(item.title)}</h2><p>事项将在两小时内到期。</p>",
-                preview="事项将在两小时内到期",
-                dedupe_key=f"deadline-2h:{item.id}",
-                expires_at=due,
-                bypass_quiet=True,
-            )
+        if remaining <= timedelta(0):
+            item.reminder_24_sent = True
             item.reminder_2_sent = True
-            count += 1
+            continue
+        if remaining <= timedelta(hours=2):
+            # Entering the urgent window supersedes an unscheduled 24-hour reminder.
+            item.reminder_24_sent = True
+            if not item.reminder_2_sent:
+                enqueue_notification(
+                    db,
+                    kind="deadline",
+                    priority="critical",
+                    title=f"即将到期：{item.title}",
+                    html_content=f"<h2>{html.escape(item.title)}</h2><p>事项将在两小时内到期。</p>",
+                    preview="事项将在两小时内到期",
+                    dedupe_key=f"deadline-2h:{item.id}",
+                    expires_at=due,
+                    bypass_quiet=True,
+                )
+                item.reminder_2_sent = True
+                count += 1
         elif remaining <= timedelta(hours=24) and not item.reminder_24_sent:
             enqueue_notification(
                 db,
@@ -65,6 +72,7 @@ def run_action_reminders(db: Session) -> int:
                 html_content=f"<h2>{html.escape(item.title)}</h2><p>事项将在 24 小时内到期。</p>",
                 preview="事项将在 24 小时内到期",
                 dedupe_key=f"deadline-24h:{item.id}",
+                expires_at=due - timedelta(hours=2),
             )
             item.reminder_24_sent = True
             count += 1

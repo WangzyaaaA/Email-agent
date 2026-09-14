@@ -24,6 +24,7 @@ from app.models import (
     utcnow,
 )
 from app.security import Cipher, mask_otp
+from app.redaction import redact_sensitive_text
 from app.services.classifier import (
     ClassificationResult,
     classify_hard,
@@ -66,7 +67,10 @@ def _complete_replied_followups(db: Session, references: list[str], in_reply_to:
     keys = {value for value in references if value}
     if in_reply_to:
         keys.add(in_reply_to)
-    keys.add(f"subject:{normalized_subject(subject)}")
+    keys.add(_subject_thread_key(subject))
+    legacy_subject = normalized_subject(subject)
+    if redact_sensitive_text(legacy_subject) == legacy_subject:
+        keys.add(f"subject:{legacy_subject}")
     if not keys:
         return
     rows = db.scalars(
@@ -79,6 +83,11 @@ def _complete_replied_followups(db: Session, references: list[str], in_reply_to:
     for row in rows:
         row.status = ActionStatus.DONE.value
         row.detail = f"{row.detail}\n已检测到回复，自动完成。".strip()
+
+
+def _subject_thread_key(subject: str) -> str:
+    # A fallback thread identifier must not persist a subject containing a secret.
+    return f"subject-hmac:{Cipher().fingerprint(normalized_subject(subject))}"
 
 
 def _save_classification(message: MessageMetadata, result: ClassificationResult, llm_status: str) -> None:
@@ -152,8 +161,10 @@ def process_remote_message(db: Session, account: MailboxAccount, remote: RemoteM
         "alibaba": ("aliyun.com", "qiye.aliyun.com", "mxhichina.com"),
     }.get(account.provider, ())
     parsed = parse_mail(remote.raw, fallback_date=remote.internal_date, trusted_auth_domains=auth_domains)
+    otp = detect_otp(parsed.subject, parsed.text, parsed.received_at)
+    sensitive_values = (otp.code,) if otp else ()
     direction = "sent" if remote.folder_role == "sent" else "inbox"
-    subject_key = f"subject:{normalized_subject(parsed.subject)}"
+    subject_key = _subject_thread_key(parsed.subject)
     thread_key = parsed.message_id or parsed.in_reply_to or (parsed.references[-1] if parsed.references else subject_key)
     message = MessageMetadata(
         account_id=account.id,
@@ -164,9 +175,9 @@ def process_remote_message(db: Session, account: MailboxAccount, remote: RemoteM
         thread_key=thread_key,
         direction=direction,
         from_address=parsed.from_address,
-        from_name=parsed.from_name,
+        from_name=redact_sensitive_text(parsed.from_name, sensitive_values),
         to_addresses=",".join(parsed.to_addresses),
-        subject=parsed.subject,
+        subject=redact_sensitive_text(parsed.subject, sensitive_values),
         received_at=parsed.received_at,
         auth_status=parsed.auth_status,
     )
@@ -193,7 +204,7 @@ def process_remote_message(db: Session, account: MailboxAccount, remote: RemoteM
     if direction == "sent":
         message.category = "sent"
         message.importance = "normal"
-        message.summary = parsed.subject or "已发送邮件"
+        message.summary = message.subject or "已发送邮件"
         message.reason = "用于待回复跟踪"
         message.llm_status = "not_used"
         if expects_reply(f"{parsed.subject}\n{parsed.text}"):
@@ -201,7 +212,7 @@ def process_remote_message(db: Session, account: MailboxAccount, remote: RemoteM
                 ActionItem(
                     message_id=message.id,
                     kind="followup",
-                    title=f"等待回复：{parsed.subject or '无主题邮件'}",
+                    title=f"等待回复：{message.subject or '无主题邮件'}",
                     detail=f"收件人：{', '.join(parsed.to_addresses)}",
                     due_at=parsed.received_at + timedelta(days=3),
                     thread_key=parsed.message_id or subject_key,
@@ -211,7 +222,6 @@ def process_remote_message(db: Session, account: MailboxAccount, remote: RemoteM
         db.commit()
         return message
 
-    otp = detect_otp(parsed.subject, parsed.text, parsed.received_at)
     if otp:
         fingerprint = Cipher().fingerprint(f"{parsed.from_address}|{otp.code}|{parsed.received_at.isoformat()}")
         trusted = _otp_rule(db, parsed.from_address)
@@ -238,7 +248,7 @@ def process_remote_message(db: Session, account: MailboxAccount, remote: RemoteM
         if status == "approved" and not remote.historical:
             received_local = _as_utc(parsed.received_at).astimezone().strftime("%Y-%m-%d %H:%M:%S")
             expiry_local = _as_utc(otp.expires_at).astimezone().strftime("%Y-%m-%d %H:%M:%S")
-            source = parsed.from_name or parsed.from_address
+            source = message.from_name or parsed.from_address
             enqueue_notification(
                 db,
                 kind="otp",
@@ -271,29 +281,25 @@ def process_remote_message(db: Session, account: MailboxAccount, remote: RemoteM
     hard = classify_hard(db, parsed.from_address, parsed.subject, parsed.text, now)
     result = hard
     llm_status = "not_configured"
-    sanitized = sanitize_for_model(parsed.subject, parsed.text)
     classifier = configured_classifier(db)
     if classifier and not remote.historical:
-        cloud, error = safe_cloud_classify(classifier, parsed.from_address, sanitized)
-        if cloud:
-            result = merge_classifications(hard, cloud)
-            llm_status = "complete"
-        else:
-            llm_status = "retrying"
-            db.add(
-                ProcessingJob(
-                    message_id=message.id,
-                    payload_encrypted=Cipher().encrypt_json(
-                        {
-                            "sender": parsed.from_address,
-                            "sanitized_text": sanitized,
-                            "historical": remote.historical,
-                        }
-                    ),
-                    expires_at=now + timedelta(hours=get_settings().model_retry_ttl_hours),
-                    last_error=error,
-                )
+        llm_status = "pending"
+        # Commit local classification and its outbox before any model network I/O.
+        # The existing durable worker owns both first attempts and retries.
+        db.add(
+            ProcessingJob(
+                message_id=message.id,
+                payload_encrypted=Cipher().encrypt_json(
+                    {
+                        "sender": parsed.from_address,
+                        "sanitized_text": sanitize_for_model(parsed.subject, parsed.text),
+                        "historical": False,
+                    }
+                ),
+                expires_at=now + timedelta(hours=get_settings().model_retry_ttl_hours),
+                next_attempt_at=now,
             )
+        )
     _save_classification(message, result, llm_status)
     _ensure_action(db, message, result, remote.historical)
     _enqueue_important(db, message, remote.historical)
@@ -320,6 +326,7 @@ def _retry_processing_jobs_locked(db: Session, limit: int = 10) -> int:
     classifier = configured_classifier(db)
     completed = 0
     for job in jobs:
+        now = utcnow()
         expires = _as_utc(job.expires_at)
         if expires <= now or not job.payload_encrypted:
             message = db.get(MessageMetadata, job.message_id)
@@ -328,7 +335,7 @@ def _retry_processing_jobs_locked(db: Session, limit: int = 10) -> int:
             db.delete(job)
             continue
         if not classifier:
-            job.next_attempt_at = now + timedelta(minutes=10)
+            job.next_attempt_at = min(expires, now + timedelta(minutes=10))
             continue
         # Short lease: a crash releases the job for recovery without letting another
         # scheduler in this deployment call the model concurrently.
@@ -339,7 +346,18 @@ def _retry_processing_jobs_locked(db: Session, limit: int = 10) -> int:
         if not cloud:
             job.attempts += 1
             job.last_error = error
-            job.next_attempt_at = now + timedelta(seconds=min(1800, 2 ** min(job.attempts + 4, 10)))
+            job.next_attempt_at = min(expires, utcnow() + timedelta(seconds=min(1800, 2 ** min(job.attempts + 4, 10))))
+            message = db.get(MessageMetadata, job.message_id)
+            if message:
+                message.llm_status = "retrying"
+            db.commit()
+            continue
+        if expires <= utcnow():
+            message = db.get(MessageMetadata, job.message_id)
+            if message:
+                message.llm_status = "expired"
+            db.delete(job)
+            db.commit()
             continue
         message = db.get(MessageMetadata, job.message_id)
         if message:
@@ -358,6 +376,7 @@ def _retry_processing_jobs_locked(db: Session, limit: int = 10) -> int:
             _enqueue_important(db, message, bool(payload.get("historical")))
         job.payload_encrypted = None
         db.delete(job)
+        db.commit()
         completed += 1
     db.commit()
     return completed

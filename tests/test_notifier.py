@@ -104,6 +104,26 @@ def test_flush_notifications_sends_and_erases_encrypted_payload(db, monkeypatch)
     assert row.payload_encrypted is None
 
 
+def test_slow_send_cannot_make_the_next_notification_send_after_expiry(db, monkeypatch) -> None:
+    clock = [datetime(2026, 9, 14, 12, tzinfo=timezone.utc)]
+    monkeypatch.setattr(notifier, "utcnow", lambda: clock[0])
+    monkeypatch.setattr(notifier, "all_settings", lambda *_: {"wxpusher_app_token": "test", "wxpusher_uid": "test"})
+    calls = []
+
+    def send(*args):
+        calls.append(args)
+        clock[0] += timedelta(minutes=2)
+        return "test-record"
+
+    monkeypatch.setattr(notifier, "_send_wxpusher", send)
+    for _ in range(2):
+        row = enqueue_notification(db, kind="otp", priority="critical", title="测试", html_content="synthetic", preview="masked", expires_at=clock[0] + timedelta(minutes=1))
+    db.commit()
+    assert flush_notifications(db) == 1
+    assert len(calls) == 1
+    assert row.status == "expired" and row.payload_encrypted is None
+
+
 def test_flush_notifications_expires_without_network(db, monkeypatch) -> None:
     monkeypatch.setattr(notifier, "get_settings", _settings)
     now = datetime(2025, 1, 1, 12, 0, tzinfo=timezone.utc)

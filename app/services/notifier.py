@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import html
-import re
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -15,6 +14,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.models import Notification, NotificationStatus, PushDevice, utcnow
 from app.push_protocol import b64url_decode
+from app.redaction import redact_sensitive_text
 from app.security import Cipher
 from app.services.fcm_channel import GatewayClient, GatewayFailure, default_expiry, freeze_envelope
 from app.store import all_settings, get_setting
@@ -32,15 +32,7 @@ def pause_notification_delivery():  # type: ignore[no-untyped-def]
 
 
 def redact_sensitive(value: str) -> str:
-    value = re.sub(
-        r"(?i)(验证码|校验码|动态码|认证码|verification\s*code|security\s*code|otp|password|token|secret)"
-        r"(\s*(?:是|为|[:：=])?\s*)([A-Za-z0-9._-]{4,})",
-        lambda match: f"{match.group(1)}{match.group(2)}[已遮盖]",
-        value,
-    )
-    value = re.sub(r"(?i)bearer\s+[A-Za-z0-9._~-]{12,}", "Bearer [已遮盖]", value)
-    value = re.sub(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]{5,})?\b", "[JWT已遮盖]", value)
-    return value[:1000]
+    return redact_sensitive_text(value)[:1000]
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -238,6 +230,7 @@ def _flush_notifications_locked(db: Session, limit: int = 20) -> int:
     uid = config.get("wxpusher_uid")
     sent = 0
     for row in rows:
+        now = utcnow()
         expires_at = _as_utc(row.expires_at) if row.expires_at else None
         if expires_at and expires_at <= now:
             row.status = NotificationStatus.EXPIRED.value

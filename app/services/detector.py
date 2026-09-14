@@ -8,6 +8,7 @@ from email.utils import parseaddr
 from dateparser.search import search_dates
 
 from app.config import get_settings
+from app.redaction import redact_sensitive_text
 
 
 OTP_KEYWORDS = re.compile(
@@ -79,10 +80,6 @@ def detect_otp(subject: str, body: str, received_at: datetime) -> OtpMatch | Non
 
 
 TRACKING_URL = re.compile(r"https?://\S+", re.IGNORECASE)
-SECRET_PATTERN = re.compile(
-    r"(?i)(验证码|校验码|动态码|认证码|verification\s*code|security\s*code|otp|password|密码|api\s*key|token|secret|访问密钥|登录凭证)"
-    r"(\s*(?:是|为|[:：])?\s*)([A-Za-z0-9_-]{4,32})"
-)
 
 
 def sanitize_for_model(subject: str, body: str) -> str:
@@ -90,10 +87,10 @@ def sanitize_for_model(subject: str, body: str) -> str:
     text = re.split(r"\n(?:From:|发件人：|-----Original Message-----)", text, maxsplit=1, flags=re.IGNORECASE)[0]
     text = re.split(r"\n--\s*\n", text, maxsplit=1)[0]
     text = TRACKING_URL.sub("[链接已移除]", text)
-    text = SECRET_PATTERN.sub(lambda match: f"{match.group(1)}{match.group(2)}[已遮盖]", text)
-    text = re.sub(r"(?i)bearer\s+[A-Za-z0-9._~-]{12,}", "Bearer [已遮盖]", text)
-    text = re.sub(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]{5,})?\b", "[JWT已遮盖]", text)
-    text = re.sub(r"(?<![A-Za-z0-9])[A-Za-z0-9_-]{32,}(?![A-Za-z0-9])", "[长凭据已遮盖]", text)
+    otp = detect_otp(subject, text, datetime.now(timezone.utc))
+    sensitive_values = (otp.code,) if otp else ()
+    text = redact_sensitive_text(text, sensitive_values)
+    subject = redact_sensitive_text(TRACKING_URL.sub("[链接已移除]", subject), sensitive_values)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return f"主题：{subject[:500]}\n正文：\n{text[:20_000]}"
 

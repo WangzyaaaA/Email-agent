@@ -13,6 +13,7 @@ from app.services.classifier import (
     OpenAICompatibleClassifier,
     classify_hard,
     merge_classifications,
+    normalize_model_url,
     safe_cloud_classify,
 )
 
@@ -59,7 +60,7 @@ def test_hard_classification_category_precedence(db) -> None:
 
 
 def test_classification_result_limits_text_and_validates_confidence() -> None:
-    result = ClassificationResult(summary=" x " * 600, reason="r" * 1500, category="other")
+    result = ClassificationResult(summary=" x " * 600, reason="原因" * 750, category="other")
     assert len(result.summary) == 1000
     assert len(result.reason) == 1000
     with pytest.raises(ValueError):
@@ -68,7 +69,7 @@ def test_classification_result_limits_text_and_validates_confidence() -> None:
 
 def test_merge_classifications_preserves_stronger_hard_signal() -> None:
     hard = ClassificationResult(category="security", importance="critical", reason="本地安全规则", action_required=True, confidence=0.9)
-    cloud = ClassificationResult(category="other", importance="low", summary="云摘要", confidence=0.99)
+    cloud = ClassificationResult(category="work", importance="low", summary="云摘要", confidence=0.99)
     merged = merge_classifications(hard, cloud)
     assert merged.category == "security"
     assert merged.importance == "critical"
@@ -107,6 +108,7 @@ def test_cloud_classifier_builds_expected_request_and_parses_fenced_json(monkeyp
     assert captured["endpoint"] == "https://llm.example/v1/chat/completions"
     assert captured["kwargs"]["headers"]["Authorization"] == "Bearer secret"
     assert captured["kwargs"]["json"]["temperature"] == 0
+    assert captured["kwargs"]["follow_redirects"] is False
     assert "不可信数据" in captured["kwargs"]["json"]["messages"][0]["content"]
 
 
@@ -115,6 +117,46 @@ def test_safe_cloud_classify_contains_error_without_raising(monkeypatch: pytest.
         raise httpx.ConnectError("offline")
 
     monkeypatch.setattr(classifier.httpx, "post", fail)
-    result, error = safe_cloud_classify(OpenAICompatibleClassifier("http://llm", "k", "m"), "a@b", "text")
+    result, error = safe_cloud_classify(OpenAICompatibleClassifier("https://llm.example", "k", "m"), "a@b", "text")
     assert result is None
     assert error is not None and error.startswith("ConnectError:")
+
+
+@pytest.mark.parametrize("url", [
+    "http://llm.example/v1", "https://user:private@llm.example/v1",
+    "https://llm.example/v1?key=private", "https://llm.example/v1#private",
+    "https:///v1", "https://llm.example:99999/v1", "https://llm.example:0/v1",
+    "https://llm.example\\@other.example/v1", "https://llm.example/\nv1",
+])
+def test_model_url_rejected_before_network_without_echoing_credentials(url, monkeypatch) -> None:
+    monkeypatch.setattr(classifier.httpx, "post", lambda *args, **kwargs: pytest.fail("unsafe URL reached network"))
+    with pytest.raises(ValueError) as caught:
+        normalize_model_url(url)
+    assert "private" not in str(caught.value)
+    result, error = safe_cloud_classify(OpenAICompatibleClassifier(url, "private", "m"), "a@b", "text")
+    assert result is None and error == "ValueError: model_classification_failed"
+
+
+def test_model_redirect_does_not_forward_credentials(monkeypatch) -> None:
+    def redirect(url, **kwargs):
+        assert kwargs["follow_redirects"] is False
+        return httpx.Response(307, headers={"Location": "http://other.example/"}, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(classifier.httpx, "post", redirect)
+    result, error = safe_cloud_classify(OpenAICompatibleClassifier("https://llm.example", "private", "m"), "a@b", "text")
+    assert result is None and error == "HTTPStatusError: model_classification_failed"
+
+
+def test_model_error_does_not_persist_raw_exception_content(monkeypatch) -> None:
+    def fail(*args, **kwargs):
+        raise httpx.ConnectError("password: private-test-secret https://user:private@llm.example")
+
+    monkeypatch.setattr(classifier.httpx, "post", fail)
+    _, error = safe_cloud_classify(OpenAICompatibleClassifier("https://llm.example", "k", "m"), "a@b", "text")
+    assert error == "ConnectError: model_classification_failed"
+
+
+def test_model_output_redacts_summary_and_reason() -> None:
+    result = ClassificationResult(summary="验证码：A7B8C9", reason="password: private-test-secret")
+    assert "A7B8C9" not in result.summary
+    assert "private-test-secret" not in result.reason

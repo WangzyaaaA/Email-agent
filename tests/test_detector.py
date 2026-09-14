@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from app.services.detector import (
     detect_otp,
     expects_reply,
@@ -66,7 +68,7 @@ def test_sanitize_for_model_removes_tracking_urls_secrets_and_quoted_history() -
 
 
 def test_sanitize_for_model_limits_subject_and_body() -> None:
-    result = sanitize_for_model("s" * 700, "body\n" + "x" * 50_000)
+    result = sanitize_for_model("标题" * 350, "body\n" + "内容" * 25_000)
     assert len(result.split("\n", 1)[0]) == len("主题：") + 500
     assert len(result.split("正文：\n", 1)[1]) <= 20_000
 
@@ -88,3 +90,13 @@ def test_sender_domain_and_subject_normalization() -> None:
     assert sender_domain("Name <User@Example.COM>") == "example.com"
     assert sender_domain("invalid") == ""
     assert normalized_subject(" Re: 回复：FWD: 项目更新 ") == "项目更新"
+@pytest.mark.parametrize("subject, secret", [
+    ("password: PrivateReviewSecret", "PrivateReviewSecret"),
+    ("741852 is your verification code", "741852"),
+    ("验证码为 A7B8C9", "A7B8C9"),
+    ("API Key: abcdefghijklmnopqrstuvwxyz0123456789", "abcdefghijklmnopqrstuvwxyz0123456789"),
+    ("登录链接 https://example.com/?token=private-value", "private-value"),
+])
+def test_model_sanitization_covers_subject_and_body(subject: str, secret: str) -> None:
+    sanitized = sanitize_for_model(subject, subject)
+    assert secret not in sanitized

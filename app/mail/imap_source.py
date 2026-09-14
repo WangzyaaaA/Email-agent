@@ -269,7 +269,7 @@ class IMAPMailSource:
         for uid in uids:
             values = fetched.get(uid)
             if not values:
-                break
+                raise IMAPClientError("fetch failed: required message metadata missing")
             header_raw = values.get(b"BODY[HEADER]") or next(
                 (
                     value
@@ -280,12 +280,15 @@ class IMAPMailSource:
             )
             structure = values.get(b"BODYSTRUCTURE")
             if not isinstance(header_raw, bytes) or structure is None:
-                break
+                raise IMAPClientError("fetch failed: required header or BODYSTRUCTURE missing")
             parts = text_parts_from_structure(structure)
             bodies: list[tuple[TextPart, str]] = []
             total_bytes = 0
             for part in parts:
-                request = f"BODY.PEEK[{part.section}]<0.{MAX_TEXT_PART_BYTES}>"
+                remaining = MAX_TEXT_TOTAL_BYTES - total_bytes
+                if remaining <= 0:
+                    break
+                request = f"BODY.PEEK[{part.section}]<0.{min(MAX_TEXT_PART_BYTES, remaining)}>"
                 part_response = self.client.fetch([uid], [request]).get(uid, {})
                 section_marker = f"BODY[{part.section}]".encode()
                 raw_part = next(
@@ -297,10 +300,9 @@ class IMAPMailSource:
                     None,
                 )
                 if raw_part is None:
-                    continue
-                remaining = MAX_TEXT_TOTAL_BYTES - total_bytes
-                if remaining <= 0:
-                    break
+                    # An absent section is a failed fetch, not an empty body.
+                    # Abort this batch so initial-sync and UID checkpoints stay intact.
+                    raise IMAPClientError("fetch failed: required text section missing")
                 raw_part = raw_part[:remaining]
                 total_bytes += len(raw_part)
                 bodies.append((part, _decode_part(raw_part, part)))

@@ -21,8 +21,10 @@ logger = logging.getLogger(__name__)
 
 def _fingerprint(account: MailboxAccount) -> tuple:
     return (
-        account.updated_at.isoformat() if account.updated_at else "",
         account.enabled,
+        account.host_confirmed,
+        account.provider,
+        account.email_address,
         account.imap_host,
         account.imap_port,
         account.username,
@@ -36,9 +38,13 @@ class AccountMonitor(threading.Thread):
         self.account_id = account_id
         self.fingerprint = fingerprint
         self.stop_event = threading.Event()
+        self.sync_event = threading.Event()
 
     def stop(self) -> None:
         self.stop_event.set()
+
+    def request_sync(self) -> None:
+        self.sync_event.set()
 
     def _load(self) -> tuple[MailboxAccount, str] | None:
         with SessionLocal() as db:
@@ -81,10 +87,11 @@ class AccountMonitor(threading.Thread):
                 backoff = 5
                 last_reconcile = datetime.now(timezone.utc)
                 while not self.stop_event.is_set():
-                    changed = source.wait_for_changes(self.stop_event, settings.poll_seconds)
+                    changed = self.sync_event.is_set() or source.wait_for_changes(self.stop_event, settings.poll_seconds)
                     now = datetime.now(timezone.utc)
                     reconcile = (now - last_reconcile).total_seconds() >= settings.reconciliation_seconds
-                    if changed or reconcile:
+                    if changed or reconcile or self.sync_event.is_set():
+                        self.sync_event.clear()
                         sync_account_with_source(self.account_id, source)
                         last_reconcile = now
             except Exception as exc:
@@ -140,6 +147,13 @@ class MonitorManager:
             handle.monitor.stop()
         for handle in handles:
             handle.monitor.join(timeout=5)
+
+    def request_sync(self, account_id: int) -> None:
+        self.refresh()
+        with self._lock:
+            handle = self._handles.get(account_id)
+            if handle:
+                handle.monitor.request_sync()
 
 
 monitor_manager = MonitorManager()

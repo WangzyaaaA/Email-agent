@@ -40,6 +40,7 @@ from app.models import (
 from app.scheduler import build_scheduler
 from app.security import Cipher, hash_password, new_csrf_token, verify_password
 from app.services.digests import build_digest, due_digest_types
+from app.services.classifier import normalize_model_url
 from app.services.monitor import monitor_manager
 from app.services.notifier import enqueue_test_notification, flush_notifications, pause_notification_delivery
 from app.push_protocol import b64url_decode, b64url_encode
@@ -185,6 +186,11 @@ def setup_submit(
         return RedirectResponse("/login", status_code=303)
     if admin_password != admin_password_confirm or len(admin_password) < 12:
         return render(request, "setup.html", status_code=400, error="管理员密码至少 12 位，且两次输入必须一致")
+    if llm_base_url.strip():
+        try:
+            llm_base_url = normalize_model_url(llm_base_url)
+        except ValueError as exc:
+            return render(request, "setup.html", status_code=400, error=str(exc))
     set_setting(db, "admin_password_hash", hash_password(admin_password))
     for key, value in {
         "wxpusher_app_token": wxpusher_app_token,
@@ -494,10 +500,9 @@ def mailbox_sync(mailbox_id: int, request: Request, csrf_token: str = Form(...),
     account = db.get(MailboxAccount, mailbox_id)
     if not account:
         raise HTTPException(404, "邮箱不存在")
-    account.updated_at = utcnow()
     account.status = "pending"
     db.commit()
-    monitor_manager.refresh()
+    monitor_manager.request_sync(account.id)
     return RedirectResponse("/mailboxes", status_code=303)
 
 
@@ -966,12 +971,23 @@ def digest_detail(digest_id: int, request: Request, db: Session = Depends(get_db
 @app.get("/settings", response_class=HTMLResponse, name="settings")
 def settings_page(request: Request, db: Session = Depends(get_db)):
     require_admin(request)
+    return _render_settings(request, db)
+
+
+def _render_settings(request: Request, db: Session, *, error: str | None = None, status_code: int = 200):
     configured = {
         "wxpusher": bool(get_setting(db, "wxpusher_app_token") and get_setting(db, "wxpusher_uid")),
         "llm": bool(get_setting(db, "llm_api_key") and get_setting(db, "llm_base_url") and get_setting(db, "llm_model")),
         "llm_base_url": get_setting(db, "llm_base_url", "") or "",
         "llm_model": get_setting(db, "llm_model", "") or "",
     }
+    if configured["llm_base_url"]:
+        try:
+            normalize_model_url(configured["llm_base_url"])
+        except ValueError:
+            configured["llm"] = False
+            configured["llm_base_url"] = ""
+            error = error or "现有模型地址不符合 HTTPS 安全要求，云分类已暂停，请重新配置；本地规则继续运行"
     settings_view = {
         "quiet_start": "22:30",
         "quiet_end": "07:30",
@@ -983,7 +999,7 @@ def settings_page(request: Request, db: Session = Depends(get_db)):
         "wxpusher_configured": configured["wxpusher"],
     }
     events = db.scalars(select(AuditEvent).order_by(AuditEvent.created_at.desc()).limit(50)).all()
-    return render(request, "settings.html", configured=configured, settings=settings_view, audit_events=events, active_nav="settings")
+    return render(request, "settings.html", configured=configured, settings=settings_view, audit_events=events, active_nav="settings", error=error, status_code=status_code)
 
 
 @app.post("/settings", name="settings_update")
@@ -999,6 +1015,11 @@ def settings_update(
 ):
     require_admin(request)
     _verify_csrf(request, csrf_token)
+    if llm_base_url.strip():
+        try:
+            llm_base_url = normalize_model_url(llm_base_url)
+        except ValueError as exc:
+            return _render_settings(request, db, error=str(exc), status_code=400)
     values = {
         "wxpusher_app_token": wxpusher_app_token,
         "wxpusher_uid": wxpusher_uid,

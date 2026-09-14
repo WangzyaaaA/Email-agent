@@ -128,7 +128,7 @@ def parse_mail(
     text, attachments = _message_text(message)
     in_reply_ids = _message_ids(str(message.get("In-Reply-To", "")))
     return ParsedMail(
-        message_id=_header(str(message.get("Message-ID"))) or None,
+        message_id=_header(str(message.get("Message-ID", ""))) or None,
         subject=_header(str(message.get("Subject", ""))),
         from_address=from_address.lower(),
         from_name=_header(from_name),
