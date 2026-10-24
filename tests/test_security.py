@@ -4,6 +4,7 @@ import pytest
 
 from app.security import (
     Cipher,
+    LoginThrottle,
     hash_password,
     mask_otp,
     mask_secret,
@@ -56,3 +57,23 @@ def test_mask_otp_never_exposes_middle_digits(value: str, expected: str) -> None
 def test_mask_secret_only_exposes_edges() -> None:
     assert mask_secret("abcdefghijkl", visible=2) == "ab••••••••kl"
     assert mask_secret("abcd", visible=2) == "••••"
+
+
+def test_login_throttle_locks_only_the_failing_source() -> None:
+    throttle = LoginThrottle(limit=3, window_seconds=60, lock_seconds=30)
+    assert throttle.record_failure("10.0.0.5") == 0
+    assert throttle.record_failure("10.0.0.5") == 0
+    assert throttle.record_failure("10.0.0.5") == 30
+
+    assert throttle.blocked_for("10.0.0.5") > 0
+    assert throttle.blocked_for("10.0.0.6") == 0
+
+    throttle.reset("10.0.0.5")
+    assert throttle.blocked_for("10.0.0.5") == 0
+
+
+def test_login_throttle_bounds_tracked_sources() -> None:
+    throttle = LoginThrottle(limit=5, max_sources=4)
+    for index in range(50):
+        throttle.record_failure(f"source-{index}")
+    assert throttle.tracked_sources <= 4

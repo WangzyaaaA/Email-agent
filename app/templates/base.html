@@ -32,7 +32,7 @@
     {% endif %}
     <main class="main-content {% if not current_user|default(false) %}full-width{% endif %}">
       <header class="topbar">
-        {% if current_user|default(false) %}<button class="menu-toggle" type="button" aria-label="打开菜单" onclick="document.getElementById('sidebar').classList.toggle('open')">☰</button>{% endif %}
+        {% if current_user|default(false) %}<button class="menu-toggle" type="button" aria-label="打开菜单" data-action="toggle-sidebar">☰</button>{% endif %}
         <div class="breadcrumbs">{{ breadcrumb|default(title|default('邮箱管家')) }}</div>
         {% if current_user|default(false) %}
         <div class="topbar-actions"><span class="muted small">{{ current_user|default('管理员') }}</span><form method="post" action="{{ url_for('logout') }}" class="inline-form"><input type="hidden" name="csrf_token" value="{{ csrf_token|default('') }}"><button class="button button-ghost button-small" type="submit">退出</button></form></div>
@@ -44,6 +44,7 @@
       </div>
     </main>
   </div>
+  <script src="{{ url_for('static', path='app.js') }}" defer></script>
   {% block scripts %}{% endblock %}
 </body>
 </html>

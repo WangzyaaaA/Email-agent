@@ -6,7 +6,7 @@ import json
 import logging
 import threading
 import time
-from collections import defaultdict, deque
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -69,21 +69,52 @@ def _canonical_device_request(request: Request, body: bytes, timestamp: str, non
 
 
 class RateLimiter:
-    def __init__(self, limit: int) -> None:
+    """Sliding-window limiter with bounded memory.
+
+    The gateway is reachable from the public internet, so the source address is
+    attacker controlled. A plain dictionary keyed by peer address grows forever
+    when an attacker rotates IPv6 addresses; every bucket is therefore pruned on
+    a timer and the table is capped, evicting the least recently used peer
+    instead of refusing new clients outright.
+    """
+
+    def __init__(self, limit: int, *, max_keys: int = 8192, prune_seconds: float = 5.0) -> None:
         self.limit = limit
-        self._entries: dict[str, deque[float]] = defaultdict(deque)
+        self.max_keys = max(1, max_keys)
+        self.prune_seconds = prune_seconds
+        self._entries: dict[str, deque[float]] = {}
         self._lock = threading.Lock()
+        self._last_prune = time.monotonic()
 
     def allow(self, key: str) -> bool:
         now = time.monotonic()
         with self._lock:
-            entries = self._entries[key]
+            self._prune(now)
+            entries = self._entries.get(key)
+            if entries is None:
+                if len(self._entries) >= self.max_keys:
+                    oldest = min(self._entries, key=lambda item: self._entries[item][-1] if self._entries[item] else 0.0)
+                    self._entries.pop(oldest, None)
+                entries = self._entries[key] = deque()
             while entries and entries[0] < now - 60:
                 entries.popleft()
             if len(entries) >= self.limit:
                 return False
             entries.append(now)
             return True
+
+    def _prune(self, now: float) -> None:
+        if now - self._last_prune < self.prune_seconds:
+            return
+        cutoff = now - 60
+        for key in [key for key, values in self._entries.items() if not values or values[-1] < cutoff]:
+            self._entries.pop(key, None)
+        self._last_prune = now
+
+    @property
+    def tracked_sources(self) -> int:
+        with self._lock:
+            return len(self._entries)
 
 
 def create_app(
@@ -168,9 +199,15 @@ def create_app(
                 source = forwarded_for
         if not limiter.allow(source):
             return error_response("rate_limited", 429)
-        body = await request.body()
-        if len(body) > selected.max_request_bytes:
-            return error_response("request_too_large", 413)
+        # Read with a hard cap: a chunked request without Content-Length must not
+        # be able to make the gateway buffer an unbounded body before rejecting it.
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > selected.max_request_bytes:
+                return error_response("request_too_large", 413)
+        # Keep the bounded read available to the downstream device HMAC check.
+        request._body = bytes(body)
         return await call_next(request)
 
     def require_scope(request: Request, db: Session, scope: str) -> None:

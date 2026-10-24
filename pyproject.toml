@@ -12,7 +12,8 @@ dependencies = [
   "APScheduler>=3.10,<4",
   "argon2-cffi>=23.1,<26",
   "beautifulsoup4>=4.12,<5",
-  "cryptography>=43,<47",
+  "certifi>=2026.10.19",
+  "cryptography>=50.0.2,<51",
   "dateparser>=1.2,<2",
   "dnspython>=2.7,<3",
   "email-validator>=2.2,<3",
@@ -21,6 +22,7 @@ dependencies = [
   "imapclient>=3.0,<4",
   "itsdangerous>=2.2,<3",
   "jinja2>=3.1,<4",
+  "pillow>=13.0.0,<14",
   "pydantic-settings>=2.6,<3",
   "python-multipart>=0.0.12,<1",
   "qrcode[pil]>=8,<9",
@@ -30,7 +32,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = [
-  "pytest>=8.3,<10",
+  "pytest>=9.0.3,<10",
 ]
 gateway = [
   "google-auth>=2.40,<3",

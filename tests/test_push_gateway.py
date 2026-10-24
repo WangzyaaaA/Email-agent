@@ -18,7 +18,7 @@ from app.push_protocol import (
 from push_gateway.config import GatewaySettings
 from push_gateway.database import create_gateway_engine, create_session_factory
 from push_gateway.fcm import FcmResult
-from push_gateway.main import create_app
+from push_gateway.main import RateLimiter, create_app
 from push_gateway.models import Device, GatewayCredential, GatewayMessage, utcnow
 from push_gateway.security import GatewayCipher, new_token
 from push_gateway.service import flush_gateway_messages
@@ -285,3 +285,49 @@ def test_gateway_rejects_plain_http_and_non_json_without_echoing_secrets() -> No
         response = client.post("/v1/messages", content="secret=value", headers={"Content-Type": "text/plain"})
         assert response.status_code == 415
         assert "secret" not in response.text
+
+
+def test_gateway_rejects_oversized_chunked_body_without_buffering_it() -> None:
+    settings = GatewaySettings(
+        master_key="gateway-master-key-with-more-than-32-random-characters",
+        database_url="sqlite:///:memory:",
+        firebase_project_id="test-project",
+        max_request_bytes=1024,
+        request_rate_per_minute=1000,
+    )
+    app = create_app(settings, fcm_client=FakeFcm())
+
+    def oversized():
+        for _ in range(20):
+            yield b"x" * 512
+
+    with TestClient(app, base_url="https://gateway.test") as client:
+        response = client.post(
+            "/v1/devices/register",
+            content=oversized(),
+            headers={"Content-Type": "application/json"},
+        )
+    assert response.status_code == 413
+    assert response.json() == {"error": {"code": "request_too_large"}}
+
+
+def test_gateway_rate_limiter_keeps_memory_bounded_under_address_rotation() -> None:
+    limiter = RateLimiter(5, max_keys=8)
+    for index in range(200):
+        assert limiter.allow(f"2001:db8::{index:x}") is True
+    assert limiter.tracked_sources <= 8
+
+
+def test_gateway_rate_limiter_evicts_idle_peers_instead_of_refusing_new_ones() -> None:
+    limiter = RateLimiter(1, max_keys=2)
+    assert limiter.allow("a") is True
+    assert limiter.allow("b") is True
+    assert limiter.allow("c") is True
+    assert limiter.tracked_sources == 2
+
+
+def test_gateway_rate_limiter_still_limits_a_single_source() -> None:
+    limiter = RateLimiter(3)
+    assert all(limiter.allow("203.0.113.7") for _ in range(3))
+    assert limiter.allow("203.0.113.7") is False
+    assert limiter.allow("203.0.113.8") is True

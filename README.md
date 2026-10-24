@@ -12,6 +12,8 @@
 - 验证码仅对白名单来源推送；成功发送或过期后立即删除通知密文，数据库只长期保留不可逆指纹和遮罩预览。
 - 只信任已知邮箱服务商认证服务器写入的 SPF/DKIM/DMARC 结果，邮件自行伪造的 `Authentication-Results` 不会获得信任。
 - 管理台必须登录且所有写操作都有 CSRF 防护。应用没有自动回信、删除、移动或标记邮件的代码路径。
+- 管理台响应统一附加严格 CSP（禁止内联脚本、内联样式和第三方来源）、`X-Frame-Options: DENY`、`nosniff`、`no-referrer` 与 HTML `no-store`；交互脚本集中在 `app/static/app.js`，修改模板时不要重新引入内联事件处理器。
+- 管理员登录按来源限速：同一来源连续 5 次密码错误后锁定 5 分钟，锁定期内不再执行 Argon2 校验，避免把登录接口当成无限次的密码猜测入口。
 
 WxPusher 是第三方通知服务。完整验证码会短暂经过 WxPusher；只应为可信发件人建立白名单。自建 Android 通道会在 NAS 上加密标题、摘要和验证码，公网网关与 FCM 只看到应用层密文。
 
@@ -242,6 +244,28 @@ $env:EMAIL_AGENT_MASTER_KEY = python -c "import secrets; print(secrets.token_url
 ```
 
 自动化测试不会连接真实邮箱或 WxPusher。真实连接需要在管理台由用户确认服务器并提供授权码后测试。
+
+### 依赖安全基线
+
+用 `pip-audit` 复核已安装环境（只查询公开漏洞库，不连接真实业务服务）：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install pip-audit
+.\.venv\Scripts\python.exe -m pip_audit
+```
+
+`pyproject.toml` 里的下限用于阻止重新安装已知受影响的版本，当前基线（2026-10-24）：
+
+| 依赖 | 下限 | 修复内容 |
+| --- | --- | --- |
+| `cryptography` | 50.0.2 | openSSL/证书链验证与 PKCS#7 解密侧信道等 4 项公告，同时更换旧 wheel 内置的 OpenSSL |
+| `certifi` | 2026.10.19 | 移除私钥已泄露的 eMudhra 中间 CA 信任链 |
+| `pillow` | 13.0.0 | 13.0.0 之前的多项图像编解码越界与解压缩炸弹绕过 |
+| `pytest` | 9.0.3（仅测试依赖） | 可预测的 `/tmp/pytest-of-{user}` 目录权限问题 |
+
+不要为了让旧代码"零改动"把 `cryptography` 上限压回 `<47` 一类区间，那会静默安装带已知漏洞的版本；`tests/test_repository_security.py` 会在下限被回退时失败。本地以可编辑方式安装的本项目不在 PyPI 上，`pip-audit` 会把它列在跳过项里，这不影响其余依赖的审计结果。
+
+Android 依赖用 OSV 的 Maven 生态逐项核对：2026-10-24 对 OkHttp 5.5.0、zxing-android-embedded 4.3.0、AndroidX、Firebase BoM 34.18.0 及测试库的查询均无已公开的 Maven 安全公告。
 
 ## 运维注意事项
 

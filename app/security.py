@@ -5,6 +5,9 @@ import hashlib
 import hmac
 import json
 import secrets
+import threading
+import time
+from collections import deque
 from functools import lru_cache
 from typing import Any
 
@@ -73,6 +76,77 @@ def verify_password(encoded: str, password: str) -> bool:
         return password_hasher.verify(encoded, password)
     except (VerifyMismatchError, InvalidHashError):
         return False
+
+
+class LoginThrottle:
+    """Bounded per-source failure tracking for the administrator password.
+
+    Argon2 makes each verification expensive for the attacker, but an unlimited
+    oracle still allows a slow offline-style brute force at network speed. The
+    table is capped and pruned so rotating source addresses cannot turn the
+    limiter itself into a memory exhaustion vector.
+    """
+
+    def __init__(
+        self,
+        *,
+        limit: int = 5,
+        window_seconds: float = 900.0,
+        lock_seconds: float = 300.0,
+        max_sources: int = 2048,
+    ) -> None:
+        self.limit = max(1, limit)
+        self.window_seconds = window_seconds
+        self.lock_seconds = lock_seconds
+        self.max_sources = max(1, max_sources)
+        self._failures: dict[str, deque[float]] = {}
+        self._blocked_until: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def blocked_for(self, source: str) -> float:
+        """Return the remaining lockout in seconds, or 0 when the source may try."""
+        with self._lock:
+            now = time.monotonic()
+            until = self._blocked_until.get(source, 0.0)
+            if until > now:
+                return until - now
+            self._blocked_until.pop(source, None)
+            return 0.0
+
+    def record_failure(self, source: str) -> float:
+        """Track one failed attempt and return the new lockout (0 when still allowed)."""
+        with self._lock:
+            now = time.monotonic()
+            self._prune(now)
+            if source not in self._failures and len(self._failures) >= self.max_sources:
+                oldest = min(self._failures, key=lambda key: self._failures[key][-1] if self._failures[key] else 0.0)
+                self._failures.pop(oldest, None)
+            entries = self._failures.setdefault(source, deque())
+            entries.append(now)
+            while len(entries) > self.limit:
+                entries.popleft()
+            if len(entries) >= self.limit:
+                entries.clear()
+                self._blocked_until[source] = now + self.lock_seconds
+                return self.lock_seconds
+            return 0.0
+
+    def reset(self, source: str) -> None:
+        with self._lock:
+            self._failures.pop(source, None)
+            self._blocked_until.pop(source, None)
+
+    @property
+    def tracked_sources(self) -> int:
+        with self._lock:
+            return len(self._failures)
+
+    def _prune(self, now: float) -> None:
+        cutoff = now - self.window_seconds
+        for key in [key for key, values in self._failures.items() if not values or values[-1] < cutoff]:
+            self._failures.pop(key, None)
+        for key in [key for key, until in self._blocked_until.items() if until <= now]:
+            self._blocked_until.pop(key, None)
 
 
 def new_csrf_token() -> str:

@@ -171,10 +171,13 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip check
 ```
 
-当前本地验证基线（2026-09-02）：
+当前本地验证基线（2026-10-24）：
 
-- Python 完整测试为 96 项通过；`compileall` 与 `pip check` 通过。
-- Android `testDebugUnitTest`、Debug/Release 构建、Debug/Release Lint 和 `assembleDebugAndroidTest` 通过。
+- Python 完整测试为 175 项通过（含依赖安全下限、登录限速、网关限速器内存上限与分块请求体上限回归）；`compileall`、`pip check` 与 `pip-audit` 通过。
+- Python 依赖安全下限：`cryptography>=50.0.2`、`certifi>=2026.10.19`、`pillow>=13.0.0`、`pytest>=9.0.3`。`tests/test_repository_security.py` 会在这些下限被下调时失败。
+- 管理台统一安全响应头（严格 CSP、`X-Frame-Options: DENY`、`nosniff`、`no-referrer`、HTML `no-store`），模板不得重新引入内联事件处理器。
+- Android 依赖（OkHttp 5.5.0、zxing-android-embedded 4.3.0、AndroidX、Firebase BoM 34.18.0）的 OSV Maven 查询无已公开公告。
+- Android `testDebugUnitTest`、Debug/Release 构建、Debug/Release Lint 和 `assembleDebugAndroidTest` 通过（2026-09-02 基线，本次未重跑）。
 - Android Lint 当前为 0 个错误、11 个警告；未连接真机或模拟器，因此仪器测试只完成 APK 编译，未执行 `connectedDebugAndroidTest`。
 - 当前未配置用户 Firebase 项目标识和 release keystore；Release 结果仅为 unsigned 构建验证，不是可生产侧载包。
 
@@ -185,6 +188,8 @@ python -m venv .venv
 - 通知领取、重试、过期或夜间免打扰。
 - 摘要周期、幂等键或加密快照。
 - CSRF、会话、密码哈希、主密钥和敏感信息清理。
+- 登录失败限速、安全响应头、CSP 与模板内联脚本边界。
+- 网关请求限速器的内存上限与来源淘汰策略。
 - MX/CNAME 服务商识别与阿里邮箱故障分类。
 - 推送 HKDF/AAD/AES-GCM/HMAC、载荷上限、冻结信封和 Python/Kotlin 黄金向量。
 - 网关凭据作用域、预配顺序、防重放、幂等冲突、FCM 错误分类、租约、ACK、清理和状态指标。

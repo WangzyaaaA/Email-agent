@@ -38,7 +38,7 @@ from app.models import (
     utcnow,
 )
 from app.scheduler import build_scheduler
-from app.security import Cipher, hash_password, new_csrf_token, verify_password
+from app.security import Cipher, LoginThrottle, hash_password, new_csrf_token, verify_password
 from app.services.digests import build_digest, due_digest_types
 from app.services.classifier import normalize_model_url
 from app.services.monitor import monitor_manager
@@ -84,6 +84,38 @@ app.add_middleware(
 base_dir = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(base_dir / "templates"))
 app.mount("/static", StaticFiles(directory=str(base_dir / "static"), check_dir=False), name="static")
+
+login_throttle = LoginThrottle()
+
+# Scripts and styles live in app/static so the policy can stay strict: no inline
+# handlers, no third-party origins, no framing of the LAN administration pages.
+SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+        "font-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; "
+        "base-uri 'none'; object-src 'none'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "camera=(), geolocation=(), microphone=()",
+}
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):  # type: ignore[no-untyped-def]
+    response = await call_next(request)
+    for name, value in SECURITY_HEADERS.items():
+        response.headers.setdefault(name, value)
+    if response.headers.get("content-type", "").startswith("text/html"):
+        response.headers.setdefault("Cache-Control", "no-store")
+    if settings.secure_cookies:
+        response.headers.setdefault("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+    return response
+
+
+def _source_address(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
 
 
 def _csrf(request: Request) -> str:
@@ -225,11 +257,19 @@ def login_submit(
     db: Session = Depends(get_db),
 ):
     _verify_csrf(request, csrf_token)
+    source = _source_address(request)
+    remaining = login_throttle.blocked_for(source)
+    if remaining > 0:
+        return render(request, "login.html", status_code=429, error=f"尝试次数过多，请 {max(1, int(remaining))} 秒后再试")
     encoded = get_setting(db, "admin_password_hash") or ""
     if not verify_password(encoded, password):
+        locked = login_throttle.record_failure(source)
         audit(db, "login_failed", "Administrator login failed")
         db.commit()
+        if locked:
+            return render(request, "login.html", status_code=429, error="密码错误次数过多，请稍后再试")
         return render(request, "login.html", status_code=400, error="密码错误")
+    login_throttle.reset(source)
     request.session.clear()
     request.session["admin"] = True
     request.session["csrf_token"] = new_csrf_token()
@@ -780,8 +820,6 @@ def push_pair(
     )
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
-    response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' data:; style-src 'self'; form-action 'self'; frame-ancestors 'none'"
     return response
 
 
