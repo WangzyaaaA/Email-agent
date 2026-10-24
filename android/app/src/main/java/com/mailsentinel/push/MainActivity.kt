@@ -152,7 +152,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshStatus(message: String? = null) {
-        val paired = CredentialStore(this).load() != null
+        val state = CredentialStore(this).load()
+        val paired = state != null
         val permission = NotificationHelper.notificationsEnabled(this)
         val firebase = FirebaseApp.getApps(this).isNotEmpty()
         statusView.text = message ?: buildString {
@@ -161,6 +162,11 @@ class MainActivity : AppCompatActivity() {
             append(if (permission) "通知权限可用" else "通知权限受限")
             append(" · ")
             append(if (firebase) "Firebase 已配置" else "Firebase 未配置")
+            if (state != null) {
+                append("\n")
+                append(if (state.registered) "网关登记：已完成" else "网关登记：等待完成，暂不拉取通知")
+                state.lastError?.let { append("\n最近网关响应：").append(it) }
+            }
         }
     }
 

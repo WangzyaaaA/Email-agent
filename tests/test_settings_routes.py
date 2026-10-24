@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 from itsdangerous import TimestampSigner
 
 from app import main
-from app.models import MailboxAccount
+from app.models import MailboxAccount, PushDevice
 from app.store import get_setting, has_admin, set_setting
 
 
@@ -76,3 +76,43 @@ def test_manual_sync_uses_existing_monitor_signal(client, db, monkeypatch) -> No
     assert calls == []
     assert client.post(f"/mailboxes/{account.id}/sync", data={"csrf_token": "review-csrf"}).status_code == 303
     assert calls == [account.id]
+
+
+def test_push_status_refresh_mirrors_gateway_state_and_needs_csrf(client, db, monkeypatch) -> None:
+    set_setting(db, "fcm_device_admin_token", "device-admin-token-value")
+    device = PushDevice(
+        device_id="device_refresh01",
+        key_id="key_refresh00001",
+        gateway_url="https://gateway.example",
+        content_root_key_encrypted="unused",
+        status="active",
+    )
+    db.add(device)
+    db.commit()
+
+    assert client.post("/push/check-activation", data={"csrf_token": "wrong"}).status_code == 403
+
+    monkeypatch.setattr(
+        main.GatewayClient,
+        "activation",
+        lambda self, device_id: {"device_id": device_id, "status": "waiting_registration"},
+    )
+    assert client.post("/push/check-activation", data={"csrf_token": "review-csrf"}).status_code == 303
+    db.refresh(device)
+    assert device.status == "active" and device.last_error_code == "waiting_registration"
+    page = client.get("/push")
+    assert page.status_code == 200
+    assert "刷新网关状态" in page.text and "waiting_registration" in page.text
+
+    monkeypatch.setattr(
+        main.GatewayClient,
+        "activation",
+        lambda self, device_id: {"device_id": device_id, "status": "revoked"},
+    )
+    assert client.post("/push/check-activation", data={"csrf_token": "review-csrf"}).status_code == 303
+    db.refresh(device)
+    # A gateway side revocation must stop the stale NAS "active" view and re-open pairing.
+    assert device.status == "revoked"
+    assert device.content_root_key_encrypted is None
+    assert device.last_error_code == "revoked"
+    assert "创建十分钟配对二维码" in client.get("/push").text

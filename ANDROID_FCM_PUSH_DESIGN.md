@@ -239,7 +239,7 @@ X-MS-Nonce
 
 - 限制时间偏差，例如正负 5 分钟；
 - 在接受窗口内按设备保存已使用 nonce，重复 nonce 返回 `409 replay_detected`；
-- 对 FCM Token 登记额外要求单调递增的 `registration_version`，拒绝旧版本覆盖新 Token；
+- 对 FCM Token 登记要求单调递增的 `registration_version`，始终拒绝旧版本覆盖新 Token；仅当网关自身已清除该设备的登记（例如 FCM 返回 `UNREGISTERED`）时，允许用相同版本重新登记，防重放仍由 nonce 与时间戳保证；
 - 对路径、查询、请求体和 Content-Type 采用唯一规范，跨 Python/Kotlin 使用固定测试向量验证；
 - 在鉴权完成前执行严格请求体大小和速率限制。
 
@@ -250,6 +250,7 @@ X-MS-Nonce
 - NAS 只有在网关确认吊销后才删除本地 content root key；网关暂时不可达时本地先停用通道并持续重试吊销，不能恢复使用旧设备。
 - 重新配对必须生成全新的 device token、content root key 和 key ID。旧密钥不允许续配。
 - 吊销或轮换时，本地尚未提交的旧 key ID 信封必须作废；符合回退条件的紧急通知可重新从现有 NAS 加密载荷生成新路线，其他通知标记为需要管理员处理，不得用已吊销密钥继续发送。
+- App 只能在网关确认过该设备激活之后，才允许因鉴权失败删除本地配对与密文。`pending_activation` 窗口（已预配、尚未完成登记）返回独立的 `device_not_activated`，App 按暂时性失败重试，禁止据此清除配对。
 
 ## 7. 通知密文与 FCM 载荷
 

@@ -1,12 +1,12 @@
 package com.mailsentinel.push
 
-import android.app.NotificationManager
 import android.content.Context
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
 import androidx.work.Data
 import androidx.work.ExistingWorkPolicy
+import androidx.work.ListenableWorker.Result
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.OutOfQuotaPolicy
@@ -30,6 +30,14 @@ object WorkScheduling {
     }
 
     fun sync(context: Context) {
+        val state = CredentialStore(context).load() ?: return
+        if (!state.registered) {
+            // The gateway only serves a device it has registered. A sync request inside that
+            // activation window used to come back as an authentication failure and delete the
+            // fresh pairing, so registration owns this window instead.
+            register(context)
+            return
+        }
         val request = OneTimeWorkRequestBuilder<SyncWorker>()
             .setConstraints(network)
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
@@ -47,9 +55,33 @@ object WorkScheduling {
     }
 }
 
+/** Codes that mean the gateway no longer accepts this device once it was activated. */
+private val revokedDeviceCodes = setOf("invalid_device_credentials", "device_mismatch", "pairing_expired")
+
 private fun clearRevokedState(context: Context) {
     CredentialStore(context).clear()
     MessageStore(context).clearAll()
+}
+
+/**
+ * Maps a stable gateway error code onto a work result.
+ *
+ * Local key material and ciphertext are deleted only for a device the gateway has already
+ * accepted, so the activation window (provisioned but not yet registered) can never destroy a
+ * fresh pairing. Every code is kept as a displayable diagnostic instead.
+ */
+private fun gatewayFailureOutcome(context: Context, state: CredentialState, code: String): Result {
+    val store = CredentialStore(context)
+    if (code == "device_not_activated") {
+        store.recordError(code)
+        return Result.retry()
+    }
+    if (code in revokedDeviceCodes && state.registered) {
+        clearRevokedState(context)
+        return Result.failure()
+    }
+    store.recordError(code)
+    return if (code == "pairing_expired") Result.failure() else Result.retry()
 }
 
 class RegisterWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
@@ -68,17 +100,16 @@ class RegisterWorker(context: Context, params: WorkerParameters) : CoroutineWork
             try {
                 api.register()
             } catch (exc: GatewayApiException) {
+                // The gateway already holds a registration for this device; it is activated.
                 if (exc.code != "stale_registration_version") throw exc
             }
+            store.markRegistered()
             val status = NotificationState.read(applicationContext)
             api.updateStatus(status.notifications, status.otp, status.important, status.digest)
             WorkScheduling.sync(applicationContext)
             Result.success()
         } catch (exc: GatewayApiException) {
-            if (exc.code in setOf("invalid_device_credentials", "pairing_expired", "device_mismatch")) {
-                clearRevokedState(applicationContext)
-                Result.failure()
-            } else Result.retry()
+            gatewayFailureOutcome(applicationContext, state, exc.code)
         } catch (_: Exception) {
             Result.retry()
         }
@@ -95,15 +126,13 @@ class AckWorker(context: Context, params: WorkerParameters) : CoroutineWorker(co
         try {
             GatewayApi(state).acknowledge(row.gatewayMessageId, result)
             localStore.markAcknowledged(messageId)
+            CredentialStore(applicationContext).recordError(null)
             Result.success()
         } catch (exc: GatewayApiException) {
             if (exc.code == "not_found") {
                 localStore.markAcknowledged(messageId)
                 Result.success()
-            } else if (exc.code in setOf("invalid_device_credentials", "device_mismatch")) {
-                clearRevokedState(applicationContext)
-                Result.failure()
-            } else Result.retry()
+            } else gatewayFailureOutcome(applicationContext, state, exc.code)
         } catch (_: Exception) {
             Result.retry()
         }
@@ -113,6 +142,10 @@ class AckWorker(context: Context, params: WorkerParameters) : CoroutineWorker(co
 class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val state = CredentialStore(applicationContext).load() ?: return@withContext Result.success()
+        if (!state.registered) {
+            WorkScheduling.register(applicationContext)
+            return@withContext Result.success()
+        }
         val api = GatewayApi(state)
         val processor = MessageProcessor(applicationContext)
         try {
@@ -135,16 +168,14 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
             processor.showStoredWhenPermissionReturns()
             val status = NotificationState.read(applicationContext)
             api.updateStatus(status.notifications, status.otp, status.important, status.digest)
+            CredentialStore(applicationContext).recordError(null)
             MessageStore(applicationContext).cleanup()
             for (row in MessageStore(applicationContext).unacknowledged()) {
                 WorkScheduling.acknowledge(applicationContext, row.messageId, false)
             }
             if (retryNeeded) Result.retry() else Result.success()
         } catch (exc: GatewayApiException) {
-            if (exc.code in setOf("invalid_device_credentials", "device_mismatch")) {
-                clearRevokedState(applicationContext)
-                Result.failure()
-            } else Result.retry()
+            gatewayFailureOutcome(applicationContext, state, exc.code)
         } catch (_: Exception) {
             Result.retry()
         }

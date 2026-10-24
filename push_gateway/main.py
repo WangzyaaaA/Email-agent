@@ -195,20 +195,22 @@ def create_app(
         except ValueError as exc:
             raise ApiFailure("authentication_required", 401) from exc
         device = db.scalar(select(Device).where(Device.device_token_fingerprint == cipher.fingerprint(token)))
-        allowed_states = {"active", "waiting_registration"}
-        if allow_pending:
-            allowed_states.add("pending_activation")
-        if not device or device.status not in allowed_states or not device.device_auth_key_encrypted:
+        if not device or not device.device_auth_key_encrypted:
             raise ApiFailure("invalid_device_credentials", 401)
         now = utcnow()
-        if device.status == "pending_activation" and (
-            not device.activation_expires_at or _aware(device.activation_expires_at) <= now
-        ):
-            device.status = "pairing_expired"
-            device.device_token_fingerprint = None
-            device.device_auth_key_encrypted = None
-            db.commit()
-            raise ApiFailure("pairing_expired", 401)
+        if device.status == "pending_activation":
+            if not device.activation_expires_at or _aware(device.activation_expires_at) <= now:
+                device.status = "pairing_expired"
+                device.device_token_fingerprint = None
+                device.device_auth_key_encrypted = None
+                db.commit()
+                raise ApiFailure("pairing_expired", 401)
+            # A provisioned device that has not uploaded an FCM registration yet is not a
+            # revoked device. Keep the two apart so the app never deletes a fresh pairing.
+            if not allow_pending:
+                raise ApiFailure("device_not_activated", 409)
+        elif device.status not in {"active", "waiting_registration"}:
+            raise ApiFailure("invalid_device_credentials", 401)
         timestamp = request.headers.get("x-ms-timestamp", "")
         nonce = request.headers.get("x-ms-nonce", "")
         supplied = request.headers.get("x-ms-signature", "")
@@ -310,7 +312,13 @@ def create_app(
         device = await require_device(request, db, allow_pending=True)
         if payload.device_id != device.device_id:
             raise ApiFailure("device_mismatch", 403)
-        if payload.registration_version <= device.registration_version:
+        if payload.registration_version < device.registration_version:
+            raise ApiFailure("stale_registration_version", 409)
+        if payload.registration_version == device.registration_version and device.fcm_token_encrypted:
+            # Equal versions are accepted only while the gateway holds no registration of
+            # its own (for example after FCM reported the stored one as unregistered), so a
+            # device whose FID never changed can recover. Older versions stay rejected and
+            # replay protection continues to rely on the nonce and timestamp checks.
             raise ApiFailure("stale_registration_version", 409)
         device.fcm_token_encrypted = cipher.encrypt(payload.fcm_token)
         device.registration_version = payload.registration_version

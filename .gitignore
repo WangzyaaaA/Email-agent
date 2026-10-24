@@ -5,6 +5,7 @@ __pycache__/
 /android/.gradle/
 /android/.kotlin/
 /android/local.properties
+/android/**/google-services.json
 /android/**/build/
 /android/*.jks
 /android/*.keystore

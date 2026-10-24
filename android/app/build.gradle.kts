@@ -1,5 +1,11 @@
 plugins {
     id("com.android.application")
+    id("com.google.gms.google-services") apply false
+}
+
+// Keep local Firebase configuration optional for manual configuration and CI.
+if (file("google-services.json").isFile) {
+    apply(plugin = "com.google.gms.google-services")
 }
 
 fun quotedProperty(name: String): String {

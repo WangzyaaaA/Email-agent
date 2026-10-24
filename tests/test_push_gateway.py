@@ -103,6 +103,14 @@ def test_gateway_scope_pairing_replay_idempotency_delivery_pending_ack_and_revok
         )
         assert token_only.status_code == 401
 
+        early_target = "/v1/messages/pending?limit=50"
+        early_headers = _signed_headers(device_token, auth_key, "GET", early_target, b"")
+        early_headers.pop("Content-Type")
+        early = client.get(early_target, headers=early_headers)
+        # A provisioned device that has not registered yet must be told apart from a revoked
+        # one; the app deletes local key material only for the latter.
+        assert early.status_code == 409 and early.json()["error"]["code"] == "device_not_activated"
+
         register = json.dumps(
             {
                 "device_id": device_id,
@@ -191,6 +199,75 @@ def test_gateway_scope_pairing_replay_idempotency_delivery_pending_ack_and_revok
             assert device.fcm_token_encrypted is None
             assert device.device_auth_key_encrypted is None
             assert device.device_token_fingerprint is None
+
+
+def test_gateway_allows_reregistration_when_its_own_registration_was_invalidated() -> None:
+    settings = GatewaySettings(
+        master_key="gateway-master-key-with-more-than-32-random-characters",
+        database_url="sqlite:///:memory:",
+        firebase_project_id="test-project",
+        allow_http_for_tests=False,
+        request_rate_per_minute=1000,
+    )
+    engine = create_gateway_engine(settings)
+    factory = create_session_factory(engine)
+    device_admin = new_token()
+    cipher = GatewayCipher(settings.master_key)
+    app = create_app(settings, engine=engine, fcm_client=FakeFcm())
+    with factory() as db:
+        db.add(GatewayCredential(kind="device_admin", token_fingerprint=cipher.fingerprint(device_admin)))
+        db.commit()
+
+    root = bytes(range(32))
+    device_id = "device_reregistration"
+    device_token = b64url_encode(bytes([9]) * 32)
+    _, auth_key = derive_device_keys(root, device_id)
+    provision = {
+        "device_id": device_id,
+        "key_id": "key_reregistration",
+        "device_token": device_token,
+        "device_auth_key": b64url_encode(auth_key),
+        "activation_expires_at": (utcnow() + timedelta(minutes=10)).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    }
+    with TestClient(app, base_url="https://gateway.test") as client:
+        assert client.post("/v1/devices/provision", json=provision, headers={"Authorization": f"Bearer {device_admin}"}).status_code == 200
+        body = json.dumps(
+            {"device_id": device_id, "fcm_token": "first-registration", "registration_version": 2, "app_protocol_version": 1},
+            separators=(",", ":"),
+        ).encode()
+        first = client.post(
+            "/v1/devices/register",
+            content=body,
+            headers=_signed_headers(device_token, auth_key, "POST", "/v1/devices/register", body),
+        )
+        assert first.status_code == 200 and first.json()["status"] == "active"
+
+        # The gateway invalidates the stored registration itself (FCM reported it as
+        # unregistered); the device keeps its version because the installation id never changed.
+        with factory() as db:
+            device = db.scalar(select(Device).where(Device.device_id == device_id))
+            assert device is not None
+            device.status = "waiting_registration"
+            device.fcm_token_encrypted = None
+            db.commit()
+
+        same_version = client.post(
+            "/v1/devices/register",
+            content=body,
+            headers=_signed_headers(device_token, auth_key, "POST", "/v1/devices/register", body),
+        )
+        assert same_version.status_code == 200 and same_version.json()["status"] == "active"
+
+        older = json.dumps(
+            {"device_id": device_id, "fcm_token": "older-registration", "registration_version": 1, "app_protocol_version": 1},
+            separators=(",", ":"),
+        ).encode()
+        stale = client.post(
+            "/v1/devices/register",
+            content=older,
+            headers=_signed_headers(device_token, auth_key, "POST", "/v1/devices/register", older),
+        )
+        assert stale.status_code == 409 and stale.json()["error"]["code"] == "stale_registration_version"
 
 
 def test_gateway_rejects_plain_http_and_non_json_without_echoing_secrets() -> None:

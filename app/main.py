@@ -789,19 +789,41 @@ def push_pair(
 def push_check_activation(request: Request, csrf_token: str = Form(...), db: Session = Depends(get_db)):
     require_admin(request)
     _verify_csrf(request, csrf_token)
-    device = db.scalar(select(PushDevice).where(PushDevice.status == "pending_activation").order_by(PushDevice.created_at.desc()))
+    device = db.scalar(
+        select(PushDevice)
+        .where(PushDevice.status.in_(["pending_activation", "active"]))
+        .order_by(PushDevice.created_at.desc())
+    )
     token = get_setting(db, "fcm_device_admin_token")
     if not device or not token:
-        raise HTTPException(400, "没有待激活设备")
+        raise HTTPException(400, "没有可检查的设备")
+    previous = device.status
     try:
         result = GatewayClient(device.gateway_url, token).activation(device.device_id)
-        if result.get("status") == "active":
+        status = str(result.get("status", "pending_activation"))[:60]
+        if status == "active":
             device.status = "active"
             device.pending_device_token_encrypted = None
             device.last_error_code = None
-            audit(db, "push_device_activated", f"device={device.device_id}")
+            audit(db, "push_device_activated" if previous != "active" else "push_device_status_refreshed", f"device={device.device_id}")
+        elif status in {"revoked", "pairing_expired"}:
+            # The gateway dropped this device. Keep the NAS view in sync instead of showing a
+            # stale activation forever; re-pairing becomes available on the same page.
+            device.status = status
+            device.pending_device_token_encrypted = None
+            device.content_root_key_encrypted = None
+            device.last_error_code = status
+            audit(db, "push_device_state_changed", f"device={device.device_id} status={status}")
+        elif status == "waiting_registration":
+            # The device is still accepted, but the gateway holds no usable FCM registration,
+            # so notifications would queue instead of being delivered.
+            if device.status != "active":
+                device.status = "active"
+                device.pending_device_token_encrypted = None
+            device.last_error_code = "waiting_registration"
         else:
-            device.last_error_code = str(result.get("status", "pending_activation"))[:60]
+            device.status = "pending_activation"
+            device.last_error_code = "pending_activation"
     except GatewayFailure as exc:
         device.last_error_code = exc.code
     db.commit()

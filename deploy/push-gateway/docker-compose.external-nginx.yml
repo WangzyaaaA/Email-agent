@@ -1,0 +1,37 @@
+# Standalone alternative; use -f for EVERY command, not as an override.
+services:
+  gateway:
+    build:
+      context: ../..
+      dockerfile: push_gateway/Dockerfile
+    restart: unless-stopped
+    environment:
+      PUSH_GATEWAY_MASTER_KEY: "${PUSH_GATEWAY_MASTER_KEY:?Set PUSH_GATEWAY_MASTER_KEY}"
+      PUSH_GATEWAY_DATABASE_URL: "sqlite:////data/push_gateway.db"
+      PUSH_GATEWAY_HOST: "0.0.0.0"
+      PUSH_GATEWAY_PORT: "8090"
+      PUSH_GATEWAY_FIREBASE_PROJECT_ID: "${PUSH_GATEWAY_FIREBASE_PROJECT_ID:?Set Firebase project id}"
+      PUSH_GATEWAY_FIREBASE_SERVICE_ACCOUNT_FILE: "/run/secrets/firebase-service-account.json"
+      PUSH_GATEWAY_TRUSTED_PROXY_HEADERS: "true"
+    volumes:
+      - gateway-data:/data
+      - ./secrets/firebase-service-account.json:/run/secrets/firebase-service-account.json:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      nginx:
+        aliases:
+          - mail-sentinel-push-gateway
+
+networks:
+  nginx:
+    external: true
+    name: nginx
+
+volumes:
+  gateway-data:

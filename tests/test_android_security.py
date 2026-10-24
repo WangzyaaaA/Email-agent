@@ -7,6 +7,13 @@ ROOT = Path(__file__).resolve().parents[1]
 ANDROID = ROOT / "android" / "app" / "src" / "main"
 
 
+def test_android_firebase_dependencies_do_not_include_analytics_or_crash_reporting() -> None:
+    dependencies = (ROOT / "android" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
+    assert 'implementation("com.google.firebase:firebase-messaging")' in dependencies
+    assert "firebase-analytics" not in dependencies
+    assert "firebase-crashlytics" not in dependencies
+
+
 def test_android_manifest_has_only_push_permissions_and_no_cleartext_or_direct_boot() -> None:
     manifest = (ANDROID / "AndroidManifest.xml").read_text(encoding="utf-8")
     permissions = {line.strip() for line in manifest.splitlines() if "uses-permission" in line}
@@ -54,3 +61,22 @@ def test_android_claims_ciphertext_before_decrypting_or_displaying_and_retries_c
     assert "fun process(gatewayMessageId: String, envelope: Envelope): ProcessResult?" in processor
     assert "if (result == null)" in worker and "retryNeeded = true" in worker
     assert "if (result == null)" in receiver and "WorkScheduling.sync(applicationContext)" in receiver
+
+
+def test_android_keeps_key_material_until_the_gateway_confirms_a_revoked_device() -> None:
+    worker = (ANDROID / "java" / "com" / "mailsentinel" / "push" / "Workers.kt").read_text(encoding="utf-8")
+    store = (ANDROID / "java" / "com" / "mailsentinel" / "push" / "CredentialStore.kt").read_text(encoding="utf-8")
+    # A provisioned but not yet registered device is not a revoked one: it has its own code and
+    # never deletes local key material.
+    assert '"device_not_activated"' in worker
+    assert "if (code in revokedDeviceCodes && state.registered)" in worker
+    assert "clearRevokedState(context)" in worker
+    # Sync work never reaches the gateway before registration completed.
+    sync_block = worker.split("fun sync(context: Context)", 1)[1].split("fun acknowledge", 1)[0]
+    assert "if (!state.registered)" in sync_block and "register(context)" in sync_block
+    assert "if (!state.registered)" in worker.split("class SyncWorker", 1)[1]
+    # The confirmed state is persisted across restarts and cleared only with the pairing.
+    assert "val registered: Boolean" in store
+    assert 'put("registered", state.registered)' in store
+    assert 'if (json.has("registered")) json.getBoolean("registered") else true' in store
+    assert "markRegistered()" in worker

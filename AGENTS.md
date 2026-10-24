@@ -71,7 +71,7 @@ Mail Sentinel 是运行在家庭 NAS 上的只读邮箱智能 Agent。当前首�
 - `app/templates/`、`app/static/`：轻量中文管理页面。
 - `push_gateway/`：独立 FastAPI 公网密文转发网关、作用域凭据、设备 API、FCM HTTP v1、队列与本地运维 CLI。
 - `push_gateway/migrations.py`：网关 schema v1 基线、已有表结构校验、版本记录和带完整性检查的 SQLite 在线备份。
-- `deploy/push-gateway/`：独立网关 Compose、Caddy 安全边界、Secret 占位和运维说明。
+- `deploy/push-gateway/`：独立网关与 Nginx 通用 Compose、复用外部 Nginx 的独立适配版、代理安全边界、Secret 占位和运维说明。
 - `android/`：API 26+ Kotlin App，包含 Keystore、FID 登记、FCM 接收、本地密文 SQLite v2、短时处理租约、隐私通知、WorkManager ACK/同步和 Gradle Wrapper。
 - `protocol_vectors.json`：Python/Kotlin 共用的密码学黄金向量；修改协议时必须同步更新两端测试。
 - `ANDROID_FCM_PUSH_DESIGN.md`：自建推送的完整安全设计、状态机、协议和验收矩阵。
@@ -228,7 +228,7 @@ Set-Location android
 - 尚未使用用户自己的 Firebase 项目、公网域名和物理 Android 设备完成端到端推送联调，也没有用户正式签名的 release APK；当前仅完成 JVM 单元测试、静态安全回归、Lint、APK 构建和仪器测试 APK 编译。
 - 首版仍只支持单台 Android 设备；FCM 可达性依赖设备上的 Google Play 服务与网络环境，目前没有真实设备送达时延或可靠性基线。
 - Push Gateway 当前迁移能力是 schema v1 基线、结构校验和备份框架；尚无实际的 v1→v2 表结构迁移，首次新增或修改已有列时必须实现新版本迁移，不能把现有框架描述为通用自动迁移。
-- 当前环境未安装 Docker，因此 Dockerfile/Compose 只做过静态校验。
+- 已在本地 WSL Docker 完成两种 Push Gateway Compose 配置解析与 Nginx 隔离代理验证；尚未完成真实公网部署或 Firebase 端到端联调。
 - Gmail OAuth、阿里邮箱 MCP、钉钉机器人、日程/待办写入、回复草稿与发送均不在首版范围。
 - 后续可增加账单/订单/快递/票务卡片、营销邮件聚合与退订建议、钓鱼和仿冒域名检测、语义搜索与附件 OCR。
 - 任何发送邮件、写入钉钉日程/待办等功能都必须是独立的可选模块，并在每次外部写入前取得用户明确授权；不得改变当前默认只读模式。
