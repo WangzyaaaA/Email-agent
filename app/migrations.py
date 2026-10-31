@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import shutil
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -56,10 +56,26 @@ def _sqlite_path(database_url: str) -> Path:
 
 
 def backup_database(database_url: str) -> Path:
+    """Create a WAL-consistent backup with the SQLite online backup API.
+
+    Copying the database file is unsafe while the application (or a crashed
+    process) still has committed pages in ``-wal``: the copy would silently miss
+    the newest rows. The backup API reads a consistent snapshot instead, and the
+    result is verified before it is handed back to the operator.
+    """
     source = _sqlite_path(database_url)
+    if not source.is_file():
+        raise FileNotFoundError("Database does not exist")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     target = source.with_name(f"{source.name}.pre-fcm-{stamp}.bak")
-    shutil.copy2(source, target)
+    if target.exists():
+        raise FileExistsError("Backup target already exists")
+    with sqlite3.connect(source) as source_db, sqlite3.connect(target) as target_db:
+        source_db.backup(target_db)
+        result = target_db.execute("PRAGMA integrity_check").fetchone()
+    if not result or result[0] != "ok":
+        target.unlink(missing_ok=True)
+        raise RuntimeError("Database backup integrity check failed")
     return target
 
 
