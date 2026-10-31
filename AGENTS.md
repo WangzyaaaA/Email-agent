@@ -54,8 +54,9 @@ Mail Sentinel 是运行在家庭 NAS 上的只读邮箱智能 Agent。当前首�
 - `app/security.py`：主密钥派生、Fernet 加密、HMAC 指纹、Argon2 密码和遮罩。
 - `app/push_protocol.py`：跨 Python/Kotlin 的 HKDF、AAD、AES-GCM、base64url、请求签名和载荷上限规范。
 - `app/store.py`：加密设置和审计写入。
+- `app/viewmodels.py`：管理台展示层（中文标签、本地时区时间、逾期判断和徽章 tone）。模板只渲染路由传入的视图字典，不要在模板里直接读取未定义的 ORM 属性或自行判断状态。
 - `app/mail/providers.py`：QQ、Gmail、Alibaba/DingMail、自定义 IMAP 预设及 MX/CNAME 识别。
-- `app/mail/imap_source.py`：只读连接、目录发现、IDLE、轮询补偿、有限 MIME section 下载和连接错误分类。
+- `app/mail/imap_source.py`：只读连接、目录发现、IDLE、轮询补偿、按块批量获取有限 MIME section 和连接错误分类。
 - `app/mail/parser.py`：邮件头、正文、线程关系和认证结果解析。
 - `app/services/detector.py`：验证码候选识别和误报排除。
 - `app/services/classifier.py`：硬规则、脱敏和可选云模型分类。
@@ -171,9 +172,10 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip check
 ```
 
-当前本地验证基线（2026-10-24）：
+当前本地验证基线（2026-10-31）：
 
-- Python 完整测试为 175 项通过（含依赖安全下限、登录限速、网关限速器内存上限与分块请求体上限回归）；`compileall`、`pip check` 与 `pip-audit` 通过。
+- Python 完整测试为 191 项通过（含依赖安全下限、登录限速、管理台视图模型与代理来源限速、主密钥不匹配提示、WAL 一致备份、网关吊销状态保留、IMAP 批量 section 获取与 512 KiB 上限、网关限速器内存上限与分块请求体上限回归）；`compileall`、`pip check` 与 `pip-audit` 通过。
+- `.github/workflows/ci.yml` 在 Python 3.12 上运行同一组命令；Android 单元测试尚未纳入 CI，需要本机 SDK 37.1。
 - Python 依赖安全下限：`cryptography>=50.0.2`、`certifi>=2026.10.19`、`pillow>=13.0.0`、`pytest>=9.0.3`。`tests/test_repository_security.py` 会在这些下限被下调时失败。
 - 管理台统一安全响应头（严格 CSP、`X-Frame-Options: DENY`、`nosniff`、`no-referrer`、HTML `no-store`），模板不得重新引入内联事件处理器。
 - Android 依赖（OkHttp 5.5.0、zxing-android-embedded 4.3.0、AndroidX、Firebase BoM 34.18.0）的 OSV Maven 查询无已公开公告。

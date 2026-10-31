@@ -14,6 +14,7 @@
 - 管理台必须登录且所有写操作都有 CSRF 防护。应用没有自动回信、删除、移动或标记邮件的代码路径。
 - 管理台响应统一附加严格 CSP（禁止内联脚本、内联样式和第三方来源）、`X-Frame-Options: DENY`、`nosniff`、`no-referrer` 与 HTML `no-store`；交互脚本集中在 `app/static/app.js`，修改模板时不要重新引入内联事件处理器。
 - 管理员登录按来源限速：同一来源连续 5 次密码错误后锁定 5 分钟，锁定期内不再执行 Argon2 校验，避免把登录接口当成无限次的密码猜测入口。
+- 若管理台通过反向代理访问，可设置 `EMAIL_AGENT_TRUSTED_PROXY_HEADERS=true`，按代理写入的 `X-Forwarded-For` 识别真实来源；该开关默认关闭，只有确认代理会覆盖该请求头时才可开启，否则攻击者可伪造来源绕过限速。
 
 WxPusher 是第三方通知服务。完整验证码会短暂经过 WxPusher；只应为可信发件人建立白名单。自建 Android 通道会在 NAS 上加密标题、摘要和验证码，公网网关与 FCM 只看到应用层密文。
 
@@ -142,7 +143,7 @@ cd /opt/mail-sentinel-test
 
 网关数据库使用显式 schema 版本基线。升级网关镜像前先停止网关应用，再运行 `docker compose run --rm gateway python -m push_gateway.cli upgrade`；命令会使用 SQLite 在线备份接口生成包含 WAL 已提交数据的一致性备份、执行完整性检查并输出 schema 版本。也可使用 `python -m push_gateway.cli backup` 单独生成经过检查的备份。不要通过删除数据库或 volume 完成升级。
 
-网关容器使用独立 SQLite 卷、非 root 用户、只读根文件系统和最小 capabilities。主密钥、Firebase 服务账号与数据库备份必须分开保存。ACK、过期或吊销会立即清除消息信封；无内容状态保留 7 天，防重放 nonce 只保留签名接受窗口。公网不启用 OpenAPI 文档。
+网关容器使用独立 SQLite 卷、非 root 用户、只读根文件系统和最小 capabilities。主密钥、Firebase 服务账号与数据库备份必须分开保存。ACK、过期或吊销会立即清除消息信封；无内容状态保留 7 天，防重放 nonce 只保留签名接受窗口。吊销设备只把仍可投递的消息改为 `revoked`，已 ACK、已过期或最终失败的历史状态保持不变，避免运维统计失真。公网不启用 OpenAPI 文档。
 
 网关对每个来源按分钟限速（默认 120 次），限速表按来源有上限并定期清理，攻击者轮换 IPv6 地址不会让内存无限增长；请求体在读取阶段就按 `PUSH_GATEWAY_MAX_REQUEST_BYTES`（默认 16 KiB）拒绝超限请求，缺少 `Content-Length` 的分块请求同样受限，不会先整体缓冲再判断。
 
@@ -225,6 +226,7 @@ App 只在网关确认过该设备激活之后才拉取通知：`pending_activat
 - 首次连接只回溯最近 7 天、每目录最多 500 封，且不会补发历史验证码或历史重要提醒。
 - IMAP 必需的邮件头、BODYSTRUCTURE 或文本 section 缺失时，当前批次失败重试，不推进 checkpoint，也不把失败的首次回溯转换为实时通知；确实返回的空文本 section 仍视为有效空正文。
 - 连接状态、错误信息和同步时间更新不会重启邮箱监控；连接配置变化才替换监控线程，手动同步通过现有线程触发，通常在当前 IDLE/轮询等待结束后执行。
+- “重试失败通知”只把可重试的通知重新排队，由后台发件箱在数秒内发送，不在管理页请求中同步等待第三方接口；单条通知的“立即重试”仍会即时发送一次。
 
 ## 本地开发与测试
 
@@ -244,6 +246,8 @@ $env:EMAIL_AGENT_MASTER_KEY = python -c "import secrets; print(secrets.token_url
 ```
 
 自动化测试不会连接真实邮箱或 WxPusher。真实连接需要在管理台由用户确认服务器并提供授权码后测试。
+
+仓库内 `.github/workflows/ci.yml` 会在推送到 `master` 和拉取请求时用 Python 3.12 执行同一组命令（完整测试、`compileall`、`pip check`），不需要任何业务凭据。Android 单元测试依赖本机或 runner 上的 SDK 37.1，暂未纳入自动流水线，仍需按上文 Gradle 命令本地执行。
 
 ### 依赖安全基线
 
