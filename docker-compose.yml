@@ -12,6 +12,7 @@ services:
       EMAIL_AGENT_PORT: "8080"
       EMAIL_AGENT_TIMEZONE: "Asia/Shanghai"
       EMAIL_AGENT_SECURE_COOKIES: "${EMAIL_AGENT_SECURE_COOKIES:-false}"
+      EMAIL_AGENT_TRUSTED_PROXY_HEADERS: "${EMAIL_AGENT_TRUSTED_PROXY_HEADERS:-false}"
       EMAIL_AGENT_LOG_LEVEL: "${EMAIL_AGENT_LOG_LEVEL:-INFO}"
     volumes:
       - mail-sentinel-data:/data

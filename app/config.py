@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     port: int = 8080
     timezone: str = "Asia/Shanghai"
     secure_cookies: bool = False
+    trusted_proxy_headers: bool = False
     log_level: str = "INFO"
     retention_days: int = 90
     poll_seconds: int = 30

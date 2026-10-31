@@ -3,13 +3,14 @@ from __future__ import annotations
 import hashlib
 import base64
 import io
+import ipaddress
 import logging
 import secrets
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
+from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -47,6 +48,20 @@ from app.push_protocol import b64url_decode, b64url_encode
 from app.services.fcm_channel import GatewayClient, GatewayFailure, new_pairing_material, normalize_gateway_url
 from app.services.push_management import finish_local_revocation, invalidate_revoked_device_envelopes
 from app.store import audit, get_setting, has_admin, set_setting
+from app.viewmodels import (
+    action_view,
+    audit_view,
+    day_bounds,
+    delta_label,
+    digest_view,
+    format_local,
+    mailbox_view,
+    message_view,
+    notification_view,
+    otp_candidate_view,
+    push_device_status_label,
+    rule_view,
+)
 
 
 settings = get_settings()
@@ -115,6 +130,20 @@ async def security_headers(request: Request, call_next):  # type: ignore[no-unty
 
 
 def _source_address(request: Request) -> str:
+    """Return the client address used for login throttling and diagnostics.
+
+    Behind the bundled Nginx configuration ``X-Forwarded-For`` is overwritten with
+    ``$remote_addr`` so it cannot be spoofed; without a reverse proxy the header is
+    attacker controlled and stays ignored. Forwarded values are only trusted when
+    the deployment opts in and the value parses as an IP address.
+    """
+    if settings.trusted_proxy_headers:
+        forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
+        try:
+            if forwarded:
+                return str(ipaddress.ip_address(forwarded))
+        except ValueError:
+            pass
     return request.client.host if request.client else "unknown"
 
 
@@ -141,6 +170,21 @@ def require_admin(request: Request) -> None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="请先登录")
 
 
+PAGE_TITLES = {
+    "dashboard.html": "总览",
+    "mailboxes.html": "邮箱",
+    "rules.html": "规则",
+    "otp_candidates.html": "验证码",
+    "actions.html": "待办事项",
+    "notifications.html": "通知记录",
+    "push.html": "Android 推送",
+    "digests.html": "周期总结",
+    "settings.html": "设置",
+    "login.html": "登录",
+    "setup.html": "初始化",
+}
+
+
 def page_context(request: Request, **values):  # type: ignore[no-untyped-def]
     return {
         "request": request,
@@ -154,6 +198,10 @@ def page_context(request: Request, **values):  # type: ignore[no-untyped-def]
 
 
 def render(request: Request, name: str, status_code: int = 200, **values) -> HTMLResponse:  # type: ignore[no-untyped-def]
+    if "title" not in values and name in PAGE_TITLES:
+        values["title"] = PAGE_TITLES[name]
+    if "breadcrumb" not in values and "title" in values:
+        values["breadcrumb"] = values["title"]
     return templates.TemplateResponse(request=request, name=name, context=page_context(request, **values), status_code=status_code)
 
 
@@ -174,14 +222,6 @@ def api_health(request: Request, db: Session = Depends(get_db)) -> dict:
     require_admin(request)
     counts = dict(db.execute(select(MailboxAccount.status, func.count()).group_by(MailboxAccount.status)).all())
     return {"status": "ok", "mailboxes": counts, "time": utcnow().isoformat()}
-
-
-def _is_overdue(value) -> bool:  # type: ignore[no-untyped-def]
-    if value is None:
-        return False
-    if value.tzinfo is None:
-        return value < utcnow().replace(tzinfo=None)
-    return value < utcnow()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -287,37 +327,63 @@ def logout(request: Request, csrf_token: str = Form(...)):
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard(request: Request, db: Session = Depends(get_db)):
     require_admin(request)
-    counts = {
-        "mailboxes": db.scalar(select(func.count()).select_from(MailboxAccount)) or 0,
-        "messages": db.scalar(select(func.count()).select_from(MessageMetadata)) or 0,
-        "actions": db.scalar(select(func.count()).select_from(ActionItem).where(ActionItem.status != ActionStatus.DONE.value)) or 0,
-        "otp_candidates": db.scalar(select(func.count()).select_from(OtpCandidate).where(OtpCandidate.status == "pending")) or 0,
-        "failed_notifications": db.scalar(select(func.count()).select_from(Notification).where(Notification.status == NotificationStatus.FAILED.value)) or 0,
-    }
+    now = utcnow()
+    start_today, start_yesterday, _start_tomorrow = day_bounds(now)
+    today_messages = db.scalar(
+        select(func.count()).select_from(MessageMetadata).where(MessageMetadata.received_at >= start_today)
+    ) or 0
+    yesterday_messages = db.scalar(
+        select(func.count())
+        .select_from(MessageMetadata)
+        .where(MessageMetadata.received_at >= start_yesterday, MessageMetadata.received_at < start_today)
+    ) or 0
+    pending_count = db.scalar(
+        select(func.count()).select_from(ActionItem).where(ActionItem.status != ActionStatus.DONE.value)
+    ) or 0
+    overdue_count = db.scalar(
+        select(func.count())
+        .select_from(ActionItem)
+        .where(
+            ActionItem.status != ActionStatus.DONE.value,
+            ActionItem.due_at.is_not(None),
+            ActionItem.due_at < now,
+        )
+    ) or 0
+    pending_otps = db.scalar(select(func.count()).select_from(OtpCandidate).where(OtpCandidate.status == "pending")) or 0
+    otp_sent = db.scalar(
+        select(func.count()).select_from(Notification).where(Notification.kind == "otp", Notification.status == "sent")
+    ) or 0
     mailboxes = db.scalars(select(MailboxAccount).order_by(MailboxAccount.created_at)).all()
     recent = db.scalars(select(MessageMetadata).order_by(MessageMetadata.received_at.desc()).limit(10)).all()
     pending_actions = db.scalars(
-        select(ActionItem).where(ActionItem.status != ActionStatus.DONE.value).order_by(ActionItem.due_at.asc()).limit(6)
+        select(ActionItem)
+        .where(ActionItem.status != ActionStatus.DONE.value)
+        .order_by(ActionItem.due_at.is_(None), ActionItem.due_at.asc(), ActionItem.created_at.desc())
+        .limit(6)
     ).all()
+    last_sync = db.scalar(select(func.max(MailboxAccount.last_sync_at)))
     healthy = sum(1 for mailbox in mailboxes if mailbox.status in {"healthy", "connected"})
     stats = {
-        "new_messages": counts["messages"],
-        "pending_actions": counts["actions"],
-        "overdue_actions": sum(1 for item in pending_actions if _is_overdue(item.due_at)),
-        "pending_otps": counts["otp_candidates"],
-        "otp_sent": db.scalar(select(func.count()).select_from(Notification).where(Notification.kind == "otp", Notification.status == "sent")) or 0,
+        "new_messages": today_messages,
+        "message_delta": delta_label(today_messages - yesterday_messages),
+        "pending_actions": pending_count,
+        "overdue_actions": overdue_count,
+        "pending_otps": pending_otps,
+        "otp_sent": otp_sent,
         "healthy_mailboxes": healthy,
         "total_mailboxes": len(mailboxes),
+        "last_sync_label": f"最近同步 {format_local(last_sync)}" if last_sync else "尚未同步",
     }
+    mailbox_views = [mailbox_view(mailbox) for mailbox in mailboxes]
     return render(
         request,
         "dashboard.html",
         stats=stats,
-        counts=counts,
-        mailboxes=mailboxes,
-        sync_status=mailboxes,
-        pending_actions=pending_actions,
-        recent_messages=recent,
+        mailboxes=mailbox_views,
+        sync_status=mailbox_views,
+        pending_actions=[action_view(item, now=now) for item in pending_actions],
+        recent_messages=[message_view(message) for message in recent],
+        today_label=f"今天是 {format_local(now, pattern='%Y-%m-%d')}，这里是你的邮箱动态。",
         active_nav="dashboard",
     )
 
@@ -326,13 +392,13 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 def mailboxes_page(request: Request, db: Session = Depends(get_db)):
     require_admin(request)
     rows = db.scalars(select(MailboxAccount).order_by(MailboxAccount.created_at)).all()
-    return render(request, "mailboxes.html", mailboxes=rows, active_nav="mailboxes")
+    return render(request, "mailboxes.html", mailboxes=[mailbox_view(row) for row in rows], active_nav="mailboxes")
 
 
 @app.get("/mailboxes/new", response_class=HTMLResponse, name="mailbox_new")
 def mailbox_new(request: Request):
     require_admin(request)
-    return render(request, "mailbox_form.html", mailbox=None, active_nav="mailboxes")
+    return render(request, "mailbox_form.html", mailbox=None, title="添加邮箱", active_nav="mailboxes")
 
 
 @app.post("/mailboxes/new/detect", response_class=HTMLResponse, name="mailbox_detect_form")
@@ -346,7 +412,7 @@ def mailbox_detect_form(
     try:
         result = detect_provider(email_address)
     except ValueError as exc:
-        return render(request, "mailbox_form.html", mailbox=None, error=str(exc), active_nav="mailboxes", status_code=400)
+        return render(request, "mailbox_form.html", mailbox=None, error=str(exc), title="添加邮箱", active_nav="mailboxes", status_code=400)
     suggested = {
         "name": email_address,
         "email_address": email_address,
@@ -362,6 +428,7 @@ def mailbox_detect_form(
         provider=result.provider,
         detected_provider="；".join(result.evidence),
         detection=result,
+        title="添加邮箱",
         active_nav="mailboxes",
     )
 
@@ -376,18 +443,22 @@ def mailbox_detect_page(
     require_admin(request)
     _verify_csrf(request, csrf_token)
     rows = db.scalars(select(MailboxAccount).order_by(MailboxAccount.created_at)).all()
+    mailboxes = [mailbox_view(row) for row in rows]
     try:
         result = detect_provider(email_address)
-        return render(request, "mailboxes.html", mailboxes=rows, detection=result, detected_email=email_address)
+        return render(request, "mailboxes.html", mailboxes=mailboxes, detection=result, detected_email=email_address)
     except ValueError as exc:
-        return render(request, "mailboxes.html", mailboxes=rows, error=str(exc), status_code=400)
+        return render(request, "mailboxes.html", mailboxes=mailboxes, error=str(exc), status_code=400)
 
 
 @app.post("/api/mailboxes/detect")
 def mailbox_detect_api(request: Request, payload: dict):
     require_admin(request)
     _verify_csrf(request, request.headers.get("X-CSRF-Token", ""))
-    result = detect_provider(str(payload.get("email_address", "")))
+    try:
+        result = detect_provider(str(payload.get("email_address", "")))
+    except ValueError as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=400)
     return {
         "provider": result.provider,
         "host": result.host,
@@ -415,17 +486,18 @@ def mailbox_add(
     require_admin(request)
     _verify_csrf(request, csrf_token)
     rows = db.scalars(select(MailboxAccount).order_by(MailboxAccount.created_at)).all()
+    mailboxes = [mailbox_view(row) for row in rows]
     try:
         normalized_email = str(TypeAdapter(EmailStr).validate_python(email_address))
     except ValidationError:
-        return render(request, "mailboxes.html", mailboxes=rows, error="邮箱地址格式不正确", status_code=400)
+        return render(request, "mailboxes.html", mailboxes=mailboxes, error="邮箱地址格式不正确", status_code=400)
     if host_confirmed != "yes":
-        return render(request, "mailboxes.html", mailboxes=rows, error="必须确认服务器地址后才能提交凭据", status_code=400)
+        return render(request, "mailboxes.html", mailboxes=mailboxes, error="必须确认服务器地址后才能提交凭据", status_code=400)
     if imap_port != 993:
-        return render(request, "mailboxes.html", mailboxes=rows, error="首版只允许 TLS IMAP 993 端口", status_code=400)
+        return render(request, "mailboxes.html", mailboxes=mailboxes, error="首版只允许 TLS IMAP 993 端口", status_code=400)
     known = {"qq", "gmail", "alibaba", "custom"}
     if provider not in known:
-        return render(request, "mailboxes.html", mailboxes=rows, error="未知邮箱类型", status_code=400)
+        return render(request, "mailboxes.html", mailboxes=mailboxes, error="未知邮箱类型", status_code=400)
     endpoint = preset_endpoint(provider)
     if endpoint and imap_host.lower() != endpoint[0]:
         provider = "custom"
@@ -452,7 +524,7 @@ def mailbox_add(
         db.commit()
     except Exception:
         db.rollback()
-        return render(request, "mailboxes.html", mailboxes=rows, error="该邮箱已存在或配置无法保存", status_code=400)
+        return render(request, "mailboxes.html", mailboxes=mailboxes, error="该邮箱已存在或配置无法保存", status_code=400)
     monitor_manager.refresh()
     return RedirectResponse("/mailboxes", status_code=303)
 
@@ -463,7 +535,7 @@ def mailbox_edit(mailbox_id: int, request: Request, db: Session = Depends(get_db
     account = db.get(MailboxAccount, mailbox_id)
     if not account:
         raise HTTPException(404, "邮箱不存在")
-    return render(request, "mailbox_form.html", mailbox=account, active_nav="mailboxes")
+    return render(request, "mailbox_form.html", mailbox=mailbox_view(account), title="编辑邮箱", active_nav="mailboxes")
 
 
 @app.post("/mailboxes/{mailbox_id}/edit", response_class=HTMLResponse, name="mailbox_update")
@@ -487,12 +559,23 @@ def mailbox_update(
     if not account:
         raise HTTPException(404, "邮箱不存在")
     if host_confirmed != "yes" or imap_port != 993:
-        return render(request, "mailbox_form.html", mailbox=account, error="必须确认 TLS 993 服务器地址", active_nav="mailboxes", status_code=400)
+        return render(request, "mailbox_form.html", mailbox=mailbox_view(account), error="必须确认 TLS 993 服务器地址", title="编辑邮箱", active_nav="mailboxes", status_code=400)
     try:
         normalized_email = str(TypeAdapter(EmailStr).validate_python(email_address)).lower()
     except ValidationError:
-        return render(request, "mailbox_form.html", mailbox=account, error="邮箱地址格式不正确", active_nav="mailboxes", status_code=400)
-    selected_password = password or Cipher().decrypt(account.password_encrypted)
+        return render(request, "mailbox_form.html", mailbox=mailbox_view(account), error="邮箱地址格式不正确", title="编辑邮箱", active_nav="mailboxes", status_code=400)
+    try:
+        selected_password = password or Cipher().decrypt(account.password_encrypted)
+    except ValueError:
+        return render(
+            request,
+            "mailbox_form.html",
+            mailbox=mailbox_view(account),
+            error="无法用当前主密钥解密已保存的凭据，请重新输入授权码后再保存",
+            title="编辑邮箱",
+            active_nav="mailboxes",
+            status_code=400,
+        )
     result = test_connection(imap_host.strip().lower(), imap_port, username.strip(), selected_password, provider)
     account.name = name.strip()[:120]
     account.email_address = normalized_email
@@ -564,7 +647,7 @@ def mailbox_toggle(account_id: int, request: Request, csrf_token: str = Form(...
 def rules_page(request: Request, db: Session = Depends(get_db)):
     require_admin(request)
     rules = db.scalars(select(Rule).order_by(Rule.kind, Rule.value)).all()
-    return render(request, "rules.html", rules=rules, active_nav="rules")
+    return render(request, "rules.html", rules=[rule_view(rule) for rule in rules], active_nav="rules")
 
 
 @app.post("/rules", name="rule_create")
@@ -620,8 +703,18 @@ def rule_delete(rule_id: int, request: Request, csrf_token: str = Form(...), db:
 @app.get("/otp-candidates", response_class=HTMLResponse, name="otp_candidates")
 def otp_candidates_page(request: Request, db: Session = Depends(get_db)):
     require_admin(request)
-    rows = db.scalars(select(OtpCandidate).order_by(OtpCandidate.created_at.desc()).limit(200)).all()
-    return render(request, "otp_candidates.html", candidates=rows, active_nav="otp")
+    rows = db.execute(
+        select(OtpCandidate, MessageMetadata.subject)
+        .outerjoin(MessageMetadata, OtpCandidate.message_id == MessageMetadata.id)
+        .order_by(OtpCandidate.created_at.desc())
+        .limit(200)
+    ).all()
+    return render(
+        request,
+        "otp_candidates.html",
+        candidates=[otp_candidate_view(candidate, subject) for candidate, subject in rows],
+        active_nav="otp",
+    )
 
 
 @app.post("/otp-candidates/{candidate_id}/approve", name="otp_approve")
@@ -664,10 +757,24 @@ def otp_candidate_block(candidate_id: int, request: Request, csrf_token: str = F
 
 
 @app.get("/actions", response_class=HTMLResponse, name="actions")
-def actions_page(request: Request, db: Session = Depends(get_db)):
+def actions_page(request: Request, status_filter: str = Query("", alias="status"), db: Session = Depends(get_db)):
     require_admin(request)
-    rows = db.scalars(select(ActionItem).order_by(ActionItem.status, ActionItem.due_at.asc())).all()
-    return render(request, "actions.html", actions=rows, statuses=[item.value for item in ActionStatus], active_nav="actions")
+    known = {item.value for item in ActionStatus}
+    selected = status_filter if status_filter in known else ""
+    query = select(ActionItem)
+    if selected:
+        query = query.where(ActionItem.status == selected)
+    rows = db.scalars(
+        query.order_by(ActionItem.due_at.is_(None), ActionItem.due_at.asc(), ActionItem.created_at.desc())
+    ).all()
+    return render(
+        request,
+        "actions.html",
+        actions=[action_view(item) for item in rows],
+        selected_status=selected,
+        statuses=[item.value for item in ActionStatus],
+        active_nav="actions",
+    )
 
 
 @app.post("/actions/{action_id}/status", name="action_update")
@@ -697,7 +804,12 @@ def action_status(
 def notifications_page(request: Request, db: Session = Depends(get_db)):
     require_admin(request)
     rows = db.scalars(select(Notification).order_by(Notification.created_at.desc()).limit(300)).all()
-    return render(request, "notifications.html", notifications=rows, active_nav="notifications")
+    return render(
+        request,
+        "notifications.html",
+        notifications=[notification_view(row) for row in rows],
+        active_nav="notifications",
+    )
 
 
 def _push_view(db: Session) -> dict:
@@ -709,6 +821,7 @@ def _push_view(db: Session) -> dict:
     }
     return {
         "device": device,
+        "device_status_label": push_device_status_label(device.status) if device else "",
         "configured": configured,
         "notification_channel": get_setting(db, "notification_channel", "wxpusher") or "wxpusher",
         "wxpusher_configured": bool(get_setting(db, "wxpusher_app_token") and get_setting(db, "wxpusher_uid")),
@@ -815,7 +928,7 @@ def push_pair(
         active_nav="push",
         pairing_payload=material.qr_payload(),
         pairing_qr=qr_data_uri,
-        pairing_expires_at=material.expires_at,
+        pairing_expires_at=format_local(material.expires_at, pattern="%Y-%m-%d %H:%M"),
         **_push_view(db),
     )
     response.headers["Cache-Control"] = "no-store"
@@ -964,9 +1077,25 @@ def notifications_retry_failed(request: Request, csrf_token: str = Form(...), db
         row.status = NotificationStatus.PENDING.value
         row.next_attempt_at = utcnow()
         row.last_error = None
+    audit(db, "notifications_retry_scheduled", f"count={len(rows)}")
     db.commit()
-    flush_notifications(db, min(20, len(rows)))
+    # The durable outbox worker picks these up within seconds. Sending them inline
+    # would hold the HTTP request open for one provider timeout per notification.
     return RedirectResponse("/notifications", status_code=303)
+
+
+def _digest_views(db: Session, runs) -> list[dict]:  # type: ignore[no-untyped-def]
+    identifiers = [run.id for run in runs]
+    statuses: dict[int, str] = {}
+    if identifiers:
+        statuses = dict(
+            db.execute(
+                select(DigestRun.id, Notification.status)
+                .outerjoin(Notification, DigestRun.notification_id == Notification.id)
+                .where(DigestRun.id.in_(identifiers))
+            ).all()
+        )
+    return [digest_view(run, statuses.get(run.id)) for run in runs]
 
 
 @app.get("/digests", response_class=HTMLResponse, name="digests")
@@ -978,8 +1107,7 @@ def digests_page(request: Request, db: Session = Depends(get_db)):
     return render(
         request,
         "digests.html",
-        digests=runs,
-        runs=runs,
+        digests=_digest_views(db, runs),
         preview_title=title,
         preview_html=preview_html,
         preview_count=item_count,
@@ -998,7 +1126,7 @@ def digest_preview(request: Request, csrf_token: str = Form(...), db: Session = 
     return render(
         request,
         "digests.html",
-        digests=runs,
+        digests=_digest_views(db, runs),
         preview_title=title,
         preview_html=content,
         preview_count=item_count,
@@ -1019,7 +1147,7 @@ def digest_detail(digest_id: int, request: Request, db: Session = Depends(get_db
     return render(
         request,
         "digests.html",
-        digests=[run],
+        digests=_digest_views(db, [run]),
         preview_title=title,
         preview_html=content,
         preview_count=item_count,
@@ -1059,7 +1187,16 @@ def _render_settings(request: Request, db: Session, *, error: str | None = None,
         "wxpusher_configured": configured["wxpusher"],
     }
     events = db.scalars(select(AuditEvent).order_by(AuditEvent.created_at.desc()).limit(50)).all()
-    return render(request, "settings.html", configured=configured, settings=settings_view, audit_events=events, active_nav="settings", error=error, status_code=status_code)
+    return render(
+        request,
+        "settings.html",
+        configured=configured,
+        settings=settings_view,
+        audit_events=[audit_view(event) for event in events],
+        active_nav="settings",
+        error=error,
+        status_code=status_code,
+    )
 
 
 @app.post("/settings", name="settings_update")
