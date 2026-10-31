@@ -30,6 +30,11 @@ from push_gateway.service import flush_gateway_messages, purge_gateway_data
 
 logger = logging.getLogger(__name__)
 
+# Terminal message states survive a later device revocation: rewriting them would
+# destroy delivery history and make the operational counters meaningless. Only
+# rows that can still be delivered are turned into "revoked".
+FINAL_MESSAGE_STATUSES = frozenset({"acknowledged", "expired", "revoked", "permanent_failed"})
+
 
 class ApiFailure(Exception):
     def __init__(self, code: str, status_code: int = 400) -> None:
@@ -338,7 +343,8 @@ def create_app(
         device.fcm_token_encrypted = None
         messages = db.scalars(select(GatewayMessage).where(GatewayMessage.device_id == device.id)).all()
         for message in messages:
-            message.status = "revoked"
+            if message.status not in FINAL_MESSAGE_STATUSES:
+                message.status = "revoked"
             message.envelope_encrypted = None
             message.lease_until = None
         db.commit()
