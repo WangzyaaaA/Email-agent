@@ -21,6 +21,13 @@ from app.mail.types import ConnectionTestResult, FolderInfo, RemoteMessage
 MAX_TEXT_PART_BYTES = 256 * 1024
 MAX_TEXT_TOTAL_BYTES = 512 * 1024
 MAX_HEADER_BYTES = 64 * 1024
+# One FETCH command carries at most this many messages. Batching removes the
+# per-message round trip, while the chunk keeps the response bounded: a chunk may
+# hold at most FETCH_BATCH_SIZE * MAX_TEXT_TOTAL_BYTES of text before decoding.
+FETCH_BATCH_SIZE = 25
+# Even a four-part chunk must fit in MAX_TEXT_TOTAL_BYTES, so the per-section cap
+# is never allowed to collapse to zero for deeply nested messages.
+MIN_TEXT_PART_BYTES = 32 * 1024
 
 
 @dataclass(slots=True)
@@ -120,6 +127,30 @@ def _decode_part(raw: bytes, part: TextPart) -> str:
         return raw.decode(part.charset or "utf-8", errors="replace")
     except LookupError:
         return raw.decode("utf-8", errors="replace")
+
+
+def _section_ordering(section: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(part) for part in section.split("."))
+    except ValueError:
+        return ()
+
+
+def _section_response(values: dict, section: str) -> bytes | None:
+    """Return a fetched section literal, or None when the server omitted it.
+
+    IMAP servers may answer a partial section request with ``BODY[1]`` or
+    ``BODY[1]<0>`` depending on implementation, so the marker is matched on the
+    section boundary instead of an exact key.
+    """
+    marker = f"BODY[{section}]".encode()
+    for key, value in values.items():
+        if not (isinstance(key, bytes) and key.startswith(marker) and isinstance(value, bytes)):
+            continue
+        rest = key[len(marker) :]
+        if rest == b"" or rest.startswith(b"<"):
+            return value
+    return None
 
 
 def _safe_message(header_raw: bytes, bodies: list[tuple[TextPart, str]]) -> bytes:
@@ -264,49 +295,21 @@ class IMAPMailSource:
             uids,
             [f"BODY.PEEK[HEADER]<0.{MAX_HEADER_BYTES}>", b"BODYSTRUCTURE", b"INTERNALDATE"],
         )
-        messages: list[RemoteMessage] = []
-        highest_complete = last_uid
+        # Parse every structure before downloading bodies: the section list of the
+        # whole batch is then known, so text can be fetched with one command per
+        # chunk instead of one command per section per message.
+        metadata: dict[int, tuple[bytes, datetime | None, list[TextPart]]] = {}
+        parts_by_uid: dict[int, list[TextPart]] = {}
         for uid in uids:
-            values = fetched.get(uid)
+            values = fetched.pop(uid, None)
             if not values:
                 raise IMAPClientError("fetch failed: required message metadata missing")
-            header_raw = values.get(b"BODY[HEADER]") or next(
-                (
-                    value
-                    for key, value in values.items()
-                    if isinstance(key, bytes) and key.startswith(b"BODY[HEADER]") and isinstance(value, bytes)
-                ),
-                None,
-            )
+            header_raw = _section_response(values, "HEADER")
             structure = values.get(b"BODYSTRUCTURE")
             if not isinstance(header_raw, bytes) or structure is None:
                 raise IMAPClientError("fetch failed: required header or BODYSTRUCTURE missing")
             parts = text_parts_from_structure(structure)
-            bodies: list[tuple[TextPart, str]] = []
-            total_bytes = 0
-            for part in parts:
-                remaining = MAX_TEXT_TOTAL_BYTES - total_bytes
-                if remaining <= 0:
-                    break
-                request = f"BODY.PEEK[{part.section}]<0.{min(MAX_TEXT_PART_BYTES, remaining)}>"
-                part_response = self.client.fetch([uid], [request]).get(uid, {})
-                section_marker = f"BODY[{part.section}]".encode()
-                raw_part = next(
-                    (
-                        value
-                        for key, value in part_response.items()
-                        if isinstance(key, bytes) and key.startswith(section_marker) and isinstance(value, bytes)
-                    ),
-                    None,
-                )
-                if raw_part is None:
-                    # An absent section is a failed fetch, not an empty body.
-                    # Abort this batch so initial-sync and UID checkpoints stay intact.
-                    raise IMAPClientError("fetch failed: required text section missing")
-                raw_part = raw_part[:remaining]
-                total_bytes += len(raw_part)
-                bodies.append((part, _decode_part(raw_part, part)))
-            raw = _safe_message(header_raw, bodies)
+            parts_by_uid[int(uid)] = parts
             internal_date = values.get(b"INTERNALDATE")
             if isinstance(internal_date, datetime):
                 if internal_date.tzinfo is None:
@@ -314,19 +317,71 @@ class IMAPMailSource:
                 internal_date = internal_date.astimezone(timezone.utc)
             else:
                 internal_date = None
-            messages.append(
-                RemoteMessage(
-                    folder=folder.name,
-                    folder_role=folder.role,
-                    uidvalidity=current_uidvalidity,
-                    uid=int(uid),
-                    raw=raw,
-                    internal_date=internal_date,
-                    historical=not initialized,
+            metadata[int(uid)] = (header_raw, internal_date, parts)
+
+        messages: list[RemoteMessage] = []
+        highest_complete = last_uid
+        for start in range(0, len(uids), FETCH_BATCH_SIZE):
+            chunk = uids[start : start + FETCH_BATCH_SIZE]
+            with_parts = [int(uid) for uid in chunk if parts_by_uid.get(int(uid))]
+            body_values = self._fetch_text_sections(with_parts, parts_by_uid) if with_parts else {}
+            for uid in chunk:
+                header_raw, internal_date, parts = metadata.pop(int(uid))
+                section_values = body_values.get(int(uid), {})
+                bodies: list[tuple[TextPart, str]] = []
+                total_bytes = 0
+                for part in parts:
+                    remaining = MAX_TEXT_TOTAL_BYTES - total_bytes
+                    if remaining <= 0:
+                        break
+                    raw_part = _section_response(section_values, part.section)
+                    if raw_part is None:
+                        # An absent section is a failed fetch, not an empty body.
+                        # Abort this batch so initial-sync and UID checkpoints stay intact.
+                        raise IMAPClientError("fetch failed: required text section missing")
+                    raw_part = raw_part[:remaining]
+                    total_bytes += len(raw_part)
+                    bodies.append((part, _decode_part(raw_part, part)))
+                raw = _safe_message(header_raw, bodies)
+                messages.append(
+                    RemoteMessage(
+                        folder=folder.name,
+                        folder_role=folder.role,
+                        uidvalidity=current_uidvalidity,
+                        uid=int(uid),
+                        raw=raw,
+                        internal_date=internal_date,
+                        historical=not initialized,
+                    )
                 )
-            )
-            highest_complete = int(uid)
+                highest_complete = int(uid)
         return messages, highest_complete, current_uidvalidity
+
+    def _fetch_text_sections(
+        self,
+        uids: list[int],
+        parts_by_uid: dict[int, list[TextPart]],
+    ) -> dict[int, dict]:
+        """Fetch the text sections of a chunk with one FETCH per batch.
+
+        The per-section byte limit is divided by the largest part count in the
+        chunk, so a single message can never download more than
+        ``MAX_TEXT_TOTAL_BYTES`` even when it has four text parts.
+        """
+        assert self.client
+        if not uids:
+            return {}
+        max_parts = max(len(parts_by_uid[uid]) for uid in uids)
+        section_cap = min(MAX_TEXT_PART_BYTES, max(MIN_TEXT_PART_BYTES, MAX_TEXT_TOTAL_BYTES // max_parts))
+        sections = sorted(
+            {part.section for uid in uids for part in parts_by_uid[uid]},
+            key=_section_ordering,
+        )
+        items = [f"BODY.PEEK[{section}]<0.{section_cap}>" for section in sections]
+        responses: dict[int, dict] = {}
+        for start in range(0, len(uids), FETCH_BATCH_SIZE):
+            responses.update(self.client.fetch(uids[start : start + FETCH_BATCH_SIZE], items))
+        return responses
 
     def wait_for_changes(self, stop_event: Event, timeout: int) -> bool:
         assert self.client

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from email import policy
 from email.parser import BytesParser
 from datetime import datetime, timezone
@@ -10,7 +11,15 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import database
-from app.mail.imap_source import IMAPMailSource, _safe_message, classify_connection_error, folder_role, text_parts_from_structure
+from app.mail.imap_source import (
+    FETCH_BATCH_SIZE,
+    MAX_TEXT_TOTAL_BYTES,
+    IMAPMailSource,
+    _safe_message,
+    classify_connection_error,
+    folder_role,
+    text_parts_from_structure,
+)
 from app.mail.types import FolderInfo
 from app.models import FolderCheckpoint, MailboxAccount, Notification, Rule
 from app.services.pipeline import sync_account_with_source
@@ -124,10 +133,14 @@ class IncompleteClient:
                 if uid == 12 and self.missing == "header":
                     result[uid].pop(b"BODY[HEADER]")
             return result
-        uid = uids[0]
-        if uid == 12 and self.missing == "section":
-            return {uid: {}}
-        return {uid: {b"BODY[1]<0>": b"" if self.empty_body else f"Verification code: {600000 + uid}".encode()}}
+        return {
+            uid: (
+                {}
+                if uid == 12 and self.missing == "section"
+                else {b"BODY[1]<0>": b"" if self.empty_body else f"Verification code: {600000 + uid}".encode()}
+            )
+            for uid in uids
+        }
 
 
 @pytest.mark.parametrize("missing", ["metadata", "header", "section"])
@@ -162,3 +175,85 @@ def test_present_empty_section_is_a_complete_fetch() -> None:
     source.client = client
     messages, highest, validity = source.fetch_new(FolderInfo("INBOX", "inbox"), "1", 10, True)
     assert len(messages) == 3 and highest == 13 and validity == "1"
+
+
+class BatchFetchClient:
+    """A mailbox whose messages expose ``part_count`` text sections each."""
+
+    def __init__(self, count: int, *, part_count: int = 2) -> None:
+        self.uids = list(range(100, 100 + count))
+        self.part_count = part_count
+        self.calls = 0
+        self.body_calls = 0
+        self.body_items: list[list[str]] = []
+
+    def _structure(self) -> tuple:
+        leaves = tuple(
+            (b"TEXT", b"PLAIN" if index % 2 == 0 else b"HTML", (b"CHARSET", b"UTF-8"), None, None, b"8BIT", 16, 1)
+            for index in range(self.part_count)
+        )
+        return (leaves, b"MIXED", (b"BOUNDARY", b"b"), None, None)
+
+    def list_folders(self):
+        return [((), "/", "INBOX")]
+
+    def select_folder(self, folder, readonly):
+        assert readonly is True
+        return {b"UIDVALIDITY": b"7"}
+
+    def search(self, criteria):
+        return self.uids
+
+    def fetch(self, uids, fields):
+        self.calls += 1
+        if b"BODYSTRUCTURE" in fields:
+            return {
+                uid: {
+                    b"BODY[HEADER]": (
+                        f"From: security@example.com\r\nSubject: Code for {uid}\r\n"
+                        f"Message-ID: <{uid}@example.com>\r\n\r\n"
+                    ).encode(),
+                    b"BODYSTRUCTURE": self._structure(),
+                    b"INTERNALDATE": datetime(2026, 9, 14, 12, tzinfo=timezone.utc),
+                }
+                for uid in uids
+            }
+        self.body_calls += 1
+        self.body_items.append([str(field) for field in fields])
+        return {
+            uid: {
+                f"BODY[{index + 1}]<0>".encode(): f"part {index} for {uid}".encode()
+                for index in range(self.part_count)
+            }
+            for uid in uids
+        }
+
+
+def test_text_sections_use_one_fetch_per_chunk_instead_of_per_message() -> None:
+    client = BatchFetchClient(70)
+    source = IMAPMailSource("imap.example.com", 993, "user", "unused", "gmail")
+    source.client = client
+
+    messages, highest, validity = source.fetch_new(FolderInfo("INBOX", "inbox"), "", 0, False)
+
+    assert len(messages) == 70
+    assert highest == 169 and validity == "7"
+    assert client.calls == 1 + math.ceil(70 / FETCH_BATCH_SIZE)
+    assert client.body_calls == math.ceil(70 / FETCH_BATCH_SIZE)
+    assert client.body_items[0] == ["BODY.PEEK[1]<0.262144>", "BODY.PEEK[2]<0.262144>"]
+    parsed = BytesParser(policy=policy.default).parsebytes(messages[0].raw)
+    assert "part 0 for 100" in parsed.get_body(preferencelist=("plain",)).get_content()
+
+
+def test_four_part_message_stays_inside_the_total_text_budget() -> None:
+    client = BatchFetchClient(3, part_count=4)
+    source = IMAPMailSource("imap.example.com", 993, "user", "unused", "gmail")
+    source.client = client
+
+    messages, highest, _validity = source.fetch_new(FolderInfo("INBOX", "inbox"), "", 0, False)
+
+    assert len(messages) == 3 and highest == 102
+    items = client.body_items[0]
+    assert len(items) == 4
+    caps = [int(item.rsplit("<0.", 1)[1].rstrip(">")) for item in items]
+    assert max(caps) * len(caps) <= MAX_TEXT_TOTAL_BYTES
